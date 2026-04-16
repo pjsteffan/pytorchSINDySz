@@ -471,7 +471,16 @@ def extract_imaginary_component(x):
 
 
 class SINDyModel(nn.Module):
-    def __init__(self, time_dim, system_features, latent_features, poly_order):
+    def __init__(
+        self,
+        time_dim,
+        system_features,
+        latent_features,
+        poly_order,
+        encoder: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+        sindy_predict: nn.Module | None = None,
+    ):
         super(SINDyModel, self).__init__()
         """SINDy model operating on batched sequences.
 
@@ -482,11 +491,24 @@ class SINDyModel(nn.Module):
         self.latent_features = latent_features
         self.poly_order = poly_order
         self.library_dim = self.compute_library_dim()
-        self.encoder = nn.Linear(system_features, latent_features)  # Example encoder
-        self.decoder = nn.Linear(latent_features, system_features)
-        self.SINDy_predict = nn.Linear(
-            self.library_dim, latent_features
-        )  # SINDy prediction layer
+
+        # Allow caller to inject custom encoder/decoder/predictor modules.
+        # Defaults preserve existing behavior.
+        self.encoder = (
+            encoder
+            if encoder is not None
+            else nn.Linear(system_features, latent_features)  # Example encoder
+        )
+        self.decoder = (
+            decoder
+            if decoder is not None
+            else nn.Linear(latent_features, system_features)
+        )
+        self.SINDy_predict = (
+            sindy_predict
+            if sindy_predict is not None
+            else nn.Linear(self.library_dim, latent_features)  # SINDy prediction layer
+        )
 
     def compute_library_dim(self):
         self_features = self.latent_features
@@ -646,10 +668,51 @@ class SINDyLoss(nn.Module):
 
 
 class SINDySz(L.LightningModule):
-    def __init__(self, model):
+    def __init__(
+        self,
+        model: SINDyModel | None = None,
+        *,
+        time_dim: int | None = None,
+        system_features: int | None = None,
+        latent_features: int | None = None,
+        poly_order: int | None = None,
+        encoder: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+        sindy_predict: nn.Module | None = None,
+        lr: float = 0.001,
+    ):
         super(SINDySz, self).__init__()
+
+        if model is None:
+            missing = [
+                name
+                for name, val in (
+                    ("time_dim", time_dim),
+                    ("system_features", system_features),
+                    ("latent_features", latent_features),
+                    ("poly_order", poly_order),
+                )
+                if val is None
+            ]
+            if missing:
+                raise TypeError(
+                    "SINDySz requires either `model` or all of: "
+                    "time_dim, system_features, latent_features, poly_order. "
+                    f"Missing: {', '.join(missing)}"
+                )
+            model = SINDyModel(
+                time_dim=time_dim,
+                system_features=system_features,
+                latent_features=latent_features,
+                poly_order=poly_order,
+                encoder=encoder,
+                decoder=decoder,
+                sindy_predict=sindy_predict,
+            )
+
         self.model = model
         self.criterion = SINDyLoss()
+        self.lr = float(lr)
 
     def forward(self, x):
         return self.model(x)
@@ -694,7 +757,7 @@ class SINDySz(L.LightningModule):
             weight.masked_fill_(weight.abs() < 1e-3, 0.0)
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        optimizer = optim.Adam(self.parameters(), lr=self.lr)
         return optimizer
 
 
