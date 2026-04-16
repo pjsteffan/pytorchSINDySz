@@ -7,6 +7,9 @@ import lightning as L
 from itertools import combinations_with_replacement
 import numpy as np
 
+#
+# Utility Functions for SINDy Fitting
+#
 
 def pytorch_hilbert(signal, axis=1):
     """Batch-aware Hilbert transform along the given axis (time).
@@ -38,7 +41,6 @@ def pytorch_hilbert(signal, axis=1):
     return analytic_signal
 
 
-
 def extract_real_component(x):
     # Expect x shape [B, T, *]; Hilbert along time (axis=1)
     return torch.abs(pytorch_hilbert(x, axis=1))
@@ -46,6 +48,11 @@ def extract_real_component(x):
 def extract_imaginary_component(x):
     # Expect x shape [B, T, *]; Hilbert along time (axis=1)
     return torch.angle(pytorch_hilbert(x, axis=1))
+
+
+#
+# SINDy Model definitions
+#
 
 class SINDyModel(nn.Module):
     def __init__(self, time_dim, system_features, latent_features,poly_order):
@@ -173,7 +180,7 @@ class SINDyLoss(nn.Module):
         super(SINDyLoss, self).__init__()
         self.lambda1 = 1.0  # SINDy loss in x_dot
         self.lambda2 = 1.0  # SINDy loss in z_dot
-        self.lambda3 = 5.0  # SINDy regularization loss 
+        self.lambda3 = 1.0  # SINDy regularization loss 
         self.lambda4 = 1.0  # z_dot via autograd Jacobian
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight):
@@ -212,7 +219,9 @@ class SINDyLoss(nn.Module):
         return loss 
 
 
-
+#
+# PyTorch Lightning Module for SINDy Training
+#
 
 class SINDySz(L.LightningModule):
     def __init__(self, model):
@@ -250,7 +259,12 @@ class SINDySz(L.LightningModule):
         self.log('test_loss', loss)
         return loss
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # Prune small SINDy weights after optimizer step so zeros persist into next iteration
+        with torch.no_grad():
+            weight = self.model.SINDy_predict.weight
+            weight.masked_fill_(weight.abs() < 1e-3, 0.0)
+
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=0.001)
         return optimizer
-

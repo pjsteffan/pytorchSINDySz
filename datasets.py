@@ -74,6 +74,11 @@ class WRsmallepoch(Dataset):
             with h5py.File(self.data_file, 'r') as f:
                 ch1_data = f['Ch.1'][start_index:int(start_index+self.epoch_num_samples)]
                 ch2_data = f['Ch.2'][start_index:int(start_index+self.epoch_num_samples)]
+                
+                ch1_mean = f['Ch.1'].attrs['mean']
+                ch1_std = f['Ch.1'].attrs['std']
+                ch2_mean = f['Ch.2'].attrs['mean']
+                ch2_std = f['Ch.2'].attrs['std']
             
             ch1_data = self.downsample(ch1_data, original_fs=self.sample_rate, target_fs=100)
             ch2_data = self.downsample(ch2_data, original_fs=self.sample_rate, target_fs=100)
@@ -84,6 +89,11 @@ class WRsmallepoch(Dataset):
             if self.psd_flag:
                 _, ch1_data = self.power_spectrum(ch1_data, fs=100.0)
                 _, ch2_data = self.power_spectrum(ch2_data, fs=100.0)
+
+            #normalize each channel separately to zero mean and unit variance
+            ch1_data = (ch1_data - ch1_mean) / (ch1_std + 1e-10)  # add small value to avoid division by zero
+            ch2_data = (ch2_data - ch2_mean) / (ch2_std + 1e-10)
+
 
             
             epoch_data = np.stack([ch1_data, ch2_data], axis=0)  # Shape: (2, num_samples)
