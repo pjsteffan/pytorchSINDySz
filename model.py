@@ -1,4 +1,4 @@
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -7,9 +7,116 @@ import lightning as L
 from itertools import combinations_with_replacement
 import numpy as np
 
+
+class FANLayer(nn.Module):
+    """FAN layer from https://arxiv.org/abs/2410.02675.
+
+    Splits outputs into (cos(p), sin(p), g) where p is a linear projection and
+    g is an activated linear projection.
+    """
+
+    def __init__(
+        self, input_dim, output_dim, p_ratio=0.45, activation="gelu", use_p_bias=True
+    ):
+        super().__init__()
+        if not (0.0 < p_ratio < 0.5):
+            raise ValueError("p_ratio must be between 0 and 0.5")
+
+        self.p_ratio = p_ratio
+        p_output_dim = int(output_dim * self.p_ratio)
+        g_output_dim = output_dim - p_output_dim * 2
+
+        self.input_linear_p = nn.Linear(input_dim, p_output_dim, bias=use_p_bias)
+        self.input_linear_g = nn.Linear(input_dim, g_output_dim)
+
+        if isinstance(activation, str):
+            self.activation = getattr(F, activation)
+        else:
+            self.activation = activation if activation else (lambda x: x)
+
+    def forward(self, src):
+        g = self.activation(self.input_linear_g(src))
+        p = self.input_linear_p(src)
+        return torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
+
+
+class ShallowFANEncoder(nn.Module):
+    """Encoder portion of shallowFAN_Sz: Win -> FAN -> fc1 -> ReLU -> fc2 -> ReLU."""
+
+    def __init__(self, input_dim, p_ratio=0.45):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.bottleneck_dim = self.input_dim // 10
+
+        self.Win = nn.Linear(self.input_dim, self.input_dim)
+        self.fan_layer1 = FANLayer(self.input_dim, self.input_dim, p_ratio=p_ratio)
+        self.fc1 = nn.Linear(self.input_dim, self.input_dim // 5)
+        self.fc2 = nn.Linear(self.input_dim // 5, self.bottleneck_dim)
+        self.activate = nn.ReLU()
+
+    def forward(self, x):
+        out = self.Win(x)
+        out = self.fan_layer1(out)
+        out = self.fc1(out)
+        out = self.activate(out)
+        out = self.fc2(out)
+        out = self.activate(out)
+        return out
+
+
+class ShallowFANDecoder(nn.Module):
+    """Decoder portion of shallowFAN_Sz: fc3 -> ReLU -> fc4 -> ReLU -> FAN -> Wout."""
+
+    def __init__(self, output_dim, p_ratio=0.45):
+        super().__init__()
+        self.output_dim = int(output_dim)
+
+        in_dim = self.output_dim // 10
+        self.fc3 = nn.Linear(in_dim, self.output_dim // 5)
+        self.fc4 = nn.Linear(self.output_dim // 5, self.output_dim)
+        self.fan_layer2 = FANLayer(self.output_dim, self.output_dim, p_ratio=p_ratio)
+        self.Wout = nn.Linear(self.output_dim, self.output_dim)
+        self.activate = nn.ReLU()
+
+    def forward(self, z):
+        out = self.fc3(z)
+        out = self.activate(out)
+        out = self.fc4(out)
+        out = self.activate(out)
+        out = self.fan_layer2(out)
+        out = self.Wout(out)
+        return out
+
+
+class ShallowFANAutoencoder(nn.Module):
+    """shallowFAN split into encoder/decoder.
+
+    Matches the original shallowFAN_Sz architecture and enforces input_dim == output_dim
+    due to the original implicit dimension coupling.
+    """
+
+    def __init__(self, input_dim, output_dim=None, p_ratio=0.45):
+        super().__init__()
+        if output_dim is None:
+            output_dim = input_dim
+        if int(input_dim) != int(output_dim):
+            raise ValueError("ShallowFANAutoencoder requires input_dim == output_dim")
+
+        self.input_dim = int(input_dim)
+        self.output_dim = int(output_dim)
+
+        self.encoder = ShallowFANEncoder(self.input_dim, p_ratio=p_ratio)
+        self.decoder = ShallowFANDecoder(self.output_dim, p_ratio=p_ratio)
+
+    def forward(self, x):
+        z = self.encoder(x)
+        return self.decoder(z)
+
+
 #
 # Utility Functions for SINDy Fitting
 #
+
 
 def pytorch_hilbert(signal, axis=1):
     """Batch-aware Hilbert transform along the given axis (time).
@@ -26,10 +133,10 @@ def pytorch_hilbert(signal, axis=1):
     H = signal.new_zeros(N)
     H[0] = 0  # DC component
     if N % 2 == 0:
-        H[1:N//2] = 2  # Positive frequencies
-        H[N//2] = 0  # Nyquist frequency if N is even
+        H[1 : N // 2] = 2  # Positive frequencies
+        H[N // 2] = 0  # Nyquist frequency if N is even
     else:
-        H[1:(N+1)//2] = 2  # Positive frequencies
+        H[1 : (N + 1) // 2] = 2  # Positive frequencies
 
     # reshape for broadcasting on the target axis
     view_shape = [1] * signal.dim()
@@ -45,6 +152,7 @@ def extract_real_component(x):
     # Expect x shape [B, T, *]; Hilbert along time (axis=1)
     return torch.abs(pytorch_hilbert(x, axis=1))
 
+
 def extract_imaginary_component(x):
     # Expect x shape [B, T, *]; Hilbert along time (axis=1)
     return torch.angle(pytorch_hilbert(x, axis=1))
@@ -54,8 +162,9 @@ def extract_imaginary_component(x):
 # SINDy Model definitions
 #
 
+
 class SINDyModel(nn.Module):
-    def __init__(self, time_dim, system_features, latent_features,poly_order):
+    def __init__(self, time_dim, system_features, latent_features, poly_order):
         super(SINDyModel, self).__init__()
         """SINDy model operating on batched sequences.
 
@@ -68,19 +177,22 @@ class SINDyModel(nn.Module):
         self.library_dim = self.compute_library_dim()
         self.encoder = nn.Linear(system_features, latent_features)  # Example encoder
         self.decoder = nn.Linear(latent_features, system_features)
-        self.SINDy_predict = nn.Linear(self.library_dim, latent_features)  # SINDy prediction layer
+        self.SINDy_predict = nn.Linear(
+            self.library_dim, latent_features
+        )  # SINDy prediction layer
 
     def compute_library_dim(self):
-        self_features = self.latent_features   
+        self_features = self.latent_features
         hilbert_features = 2 * self.latent_features
 
         poly_features = 0
-        for n in range(1, self.poly_order+1):
-            list_combinations = list(combinations_with_replacement(range(self.latent_features), n))
+        for n in range(1, self.poly_order + 1):
+            list_combinations = list(
+                combinations_with_replacement(range(self.latent_features), n)
+            )
             poly_features += len(list_combinations)
-        
-        return self_features + hilbert_features + poly_features
 
+        return self_features + hilbert_features + poly_features
 
     def compute_library(self, z):
         """Build library features for batched latent states.
@@ -151,7 +263,9 @@ class SINDyModel(nn.Module):
                 z: latent states, [B, T, latent_features]
         """
         if x.dim() != 3:
-            raise ValueError(f"Expected x shape [B, T, F] or [B, T]; got {tuple(x.shape)}")
+            raise ValueError(
+                f"Expected x shape [B, T, F] or [B, T]; got {tuple(x.shape)}"
+            )
 
         assert x.dim() == 3, "Expected x shape [B, T, F] or [B, T] (auto-unsqueezed)"
         assert x.size(1) == self.time_dim, "Time dimension mismatch"
@@ -163,24 +277,24 @@ class SINDyModel(nn.Module):
         x = x.requires_grad_(True)
 
         # Encoder/decoder act on the feature dimension (last dim) and are batch/time agnostic
-        z = self.encoder(x)                 # [B, T, latent_features]
-        theta_x = self.compute_library(z)   # [B, T, library_dim]
-        y_hat = self.SINDy_predict(theta_x) # [B, T, latent_features]
-        x_hat = self.decoder(z)             # [B, T, system_features]
+        z = self.encoder(x)  # [B, T, latent_features]
+        theta_x = self.compute_library(z)  # [B, T, library_dim]
+        y_hat = self.SINDy_predict(theta_x)  # [B, T, latent_features]
+        x_hat = self.decoder(z)  # [B, T, system_features]
 
         # Per-example Jacobian ∂z/∂x: [B, T, L, F]
         jac_z_x = self.compute_jacobian_z_wrt_x(x)
 
         # Return weights needed for loss computations (constant across batch/time)
         return y_hat, x_hat, z, jac_z_x, self.SINDy_predict.weight, self.decoder.weight
-    
+
 
 class SINDyLoss(nn.Module):
     def __init__(self):
         super(SINDyLoss, self).__init__()
         self.lambda1 = 1.0  # SINDy loss in x_dot
         self.lambda2 = 1.0  # SINDy loss in z_dot
-        self.lambda3 = 1.0  # SINDy regularization loss 
+        self.lambda3 = 1.0  # SINDy regularization loss
         self.lambda4 = 1.0  # z_dot via autograd Jacobian
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight):
@@ -201,27 +315,28 @@ class SINDyLoss(nn.Module):
         loss = F.mse_loss(x_hat, x)
 
         # Finite differences along time dimension
-        x_dot = torch.diff(x, dim=1)        # [B, T-1, F]
-        z_dot = torch.diff(z, dim=1)        # [B, T-1, L]
-        y_hat_trim = y_hat[:, :-1, :]       # align to T-1
-        jac_trim = jac_z_x[:, :-1, :, :]    # [B, T-1, L, F]
+        x_dot = torch.diff(x, dim=1)  # [B, T-1, F]
+        z_dot = torch.diff(z, dim=1)  # [B, T-1, L]
+        y_hat_trim = y_hat[:, :-1, :]  # align to T-1
+        jac_trim = jac_z_x[:, :-1, :, :]  # [B, T-1, L, F]
 
         # Predicted x_dot from y_hat via decoder Jacobian
-        x_dot_pred = torch.einsum('btl,fl->btf', y_hat_trim, decoder_weight)
+        x_dot_pred = torch.einsum("btl,fl->btf", y_hat_trim, decoder_weight)
 
         # z_dot predicted via autograd Jacobian * x_dot
-        z_dot_pred = torch.einsum('btlf,btf->btl', jac_trim, x_dot)
+        z_dot_pred = torch.einsum("btlf,btf->btl", jac_trim, x_dot)
 
         loss += self.lambda1 * F.mse_loss(x_dot_pred, x_dot)
         loss += self.lambda2 * F.mse_loss(y_hat_trim, z_dot)
         loss += self.lambda4 * F.mse_loss(z_dot_pred, z_dot)
         loss += self.lambda3 * SINDy_weights.abs().sum()
-        return loss 
+        return loss
 
 
 #
 # PyTorch Lightning Module for SINDy Training
 #
+
 
 class SINDySz(L.LightningModule):
     def __init__(self, model):
@@ -237,26 +352,32 @@ class SINDySz(L.LightningModule):
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = x.unsqueeze(-1)
         y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight)
-        self.log('train_loss', loss)
+        loss = self.criterion(
+            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
+        )
+        self.log("train_loss", loss)
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = x.unsqueeze(-1)
         y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight)
-        self.log('validation_loss', loss)
+        loss = self.criterion(
+            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
+        )
+        self.log("validation_loss", loss)
         return loss
-    
+
     def test_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = x.unsqueeze(-1)
         y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight)
-        self.log('test_loss', loss)
+        loss = self.criterion(
+            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
+        )
+        self.log("test_loss", loss)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
