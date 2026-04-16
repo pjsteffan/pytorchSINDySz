@@ -1,5 +1,9 @@
 from datasets import WRsmallepoch
-from model import SINDySz, SINDyModel
+from model import (
+    SINDySz,
+    CapacityMatchedShallowMLPAutoencoder,
+    ShallowFANAutoencoder,
+)
 
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.utils.data as data
@@ -48,27 +52,40 @@ def main(data_file, annotation_file, sample_rate=5000):
     poly_order = 2
     batch_size = 2
 
-    # Option A: build the model yourself (custom encoder/decoder can be passed here)
-    # model = SINDyModel(time_dim, system_features, latent_features, poly_order)
-    # model = model.to(torch.get_default_dtype())
-    # sindy_sz = SINDySz(model)
+    # Two experimental conditions for encoder/decoder:
+    # 1) CapacityMatchedShallowMLPEncoder/Decoder
+    # 2) ShallowFANEncoder/Decoder
+    #
+    # Note: both autoencoders are defined over the *feature* dimension; since this
+    # script uses `system_features=2`, the bottleneck becomes 0 (2//10).
+    # If you intended to encode over a larger feature vector (e.g. channels),
+    # update `system_features` accordingly.
+    conditions = [
+        ("capacity_matched_shallow_mlp", CapacityMatchedShallowMLPAutoencoder),
+        ("shallow_fan", ShallowFANAutoencoder),
+    ]
 
-    # Option B: pass all SINDyModel attributes through SINDySz
-    sindy_sz = SINDySz(
-        time_dim=time_dim,
-        system_features=system_features,
-        latent_features=latent_features,
-        poly_order=poly_order,
-        # encoder=...,  # nn.Module mapping system_features -> latent_features
-        # decoder=...,  # nn.Module mapping latent_features -> system_features
-        # sindy_predict=...,  # nn.Module mapping library_dim -> latent_features
-        lr=0.001,
-    ).to(torch.get_default_dtype())
+    for name, AE in conditions:
+        ae = AE(system_features)
+        sindy_sz = SINDySz(
+            time_dim=time_dim,
+            system_features=system_features,
+            latent_features=latent_features,
+            poly_order=poly_order,
+            encoder=ae.encoder,
+            decoder=ae.decoder,
+            lr=0.001,
+        ).to(torch.get_default_dtype())
 
-    trainer = L.Trainer(
-        max_epochs=10, log_every_n_steps=10, accelerator="gpu", devices=1
-    )
-    trainer.fit(sindy_sz, train_loader, valid_loader)
+        trainer = L.Trainer(
+            max_epochs=10,
+            log_every_n_steps=10,
+            accelerator="gpu",
+            devices=1,
+            default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_runs/{name}",
+            logger=True,
+        )
+        trainer.fit(sindy_sz, train_loader, valid_loader)
     # trainer.test(sindy_sz, dataloaders=test_loader)
 
 
