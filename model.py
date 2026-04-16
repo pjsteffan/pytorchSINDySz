@@ -43,13 +43,15 @@ class FANLayer(nn.Module):
 class ShallowFANEncoder(nn.Module):
     """Encoder portion of shallowFAN_Sz: Win -> FAN -> fc1 -> ReLU -> fc2 -> ReLU."""
 
-    def __init__(self, input_dim, p_ratio=0.45):
+    def __init__(self, input_dim, p_ratio=0.45, use_p_bias=True):
         super().__init__()
         self.input_dim = int(input_dim)
         self.bottleneck_dim = self.input_dim // 10
 
         self.Win = nn.Linear(self.input_dim, self.input_dim)
-        self.fan_layer1 = FANLayer(self.input_dim, self.input_dim, p_ratio=p_ratio)
+        self.fan_layer1 = FANLayer(
+            self.input_dim, self.input_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        )
         self.fc1 = nn.Linear(self.input_dim, self.input_dim // 5)
         self.fc2 = nn.Linear(self.input_dim // 5, self.bottleneck_dim)
         self.activate = nn.ReLU()
@@ -67,14 +69,16 @@ class ShallowFANEncoder(nn.Module):
 class ShallowFANDecoder(nn.Module):
     """Decoder portion of shallowFAN_Sz: fc3 -> ReLU -> fc4 -> ReLU -> FAN -> Wout."""
 
-    def __init__(self, output_dim, p_ratio=0.45):
+    def __init__(self, output_dim, p_ratio=0.45, use_p_bias=True):
         super().__init__()
         self.output_dim = int(output_dim)
 
         in_dim = self.output_dim // 10
         self.fc3 = nn.Linear(in_dim, self.output_dim // 5)
         self.fc4 = nn.Linear(self.output_dim // 5, self.output_dim)
-        self.fan_layer2 = FANLayer(self.output_dim, self.output_dim, p_ratio=p_ratio)
+        self.fan_layer2 = FANLayer(
+            self.output_dim, self.output_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        )
         self.Wout = nn.Linear(self.output_dim, self.output_dim)
         self.activate = nn.ReLU()
 
@@ -95,7 +99,7 @@ class ShallowFANAutoencoder(nn.Module):
     due to the original implicit dimension coupling.
     """
 
-    def __init__(self, input_dim, output_dim=None, p_ratio=0.45):
+    def __init__(self, input_dim, output_dim=None, p_ratio=0.45, use_p_bias=True):
         super().__init__()
         if output_dim is None:
             output_dim = input_dim
@@ -105,8 +109,311 @@ class ShallowFANAutoencoder(nn.Module):
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
 
-        self.encoder = ShallowFANEncoder(self.input_dim, p_ratio=p_ratio)
-        self.decoder = ShallowFANDecoder(self.output_dim, p_ratio=p_ratio)
+        self.encoder = ShallowFANEncoder(
+            self.input_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        )
+        self.decoder = ShallowFANDecoder(
+            self.output_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        )
+
+    def forward(self, x):
+        if x.dim() == 2:
+            z = self.encoder(x)
+            return self.decoder(z)
+        if x.dim() == 3:
+            b, t, f = x.shape
+            x2 = x.reshape(b * t, f)
+            z2 = self.encoder(x2)
+            y2 = self.decoder(z2)
+            return y2.reshape(b, t, f)
+        raise ValueError(f"Expected x shape [N, F] or [B, T, F]; got {tuple(x.shape)}")
+
+
+def count_parameters(module: nn.Module, trainable_only: bool = True) -> int:
+    if trainable_only:
+        return sum(p.numel() for p in module.parameters() if p.requires_grad)
+    return sum(p.numel() for p in module.parameters())
+
+
+def validate_capacity_match_shallow_mlp_vs_fan(
+    feature_dim: int,
+    p_ratio: float = 0.45,
+    use_p_bias: bool = True,
+    block_activation: str = "relu",
+    block_bias: bool = True,
+) -> dict:
+    """Validate that capacity-matched MLP encoder/decoder match FAN counterparts.
+
+    Instantiates:
+      - ShallowFANEncoder/Decoder
+      - CapacityMatchedShallowMLPEncoder/Decoder (via CapacityMatchedShallowMLPAutoencoder)
+
+    Reports parameter count deltas:
+      - encoder MLP vs FAN
+      - decoder MLP vs FAN
+      - residual blocks vs FAN layers (the intended matching budget)
+      - overall total
+    """
+
+    fdim = int(feature_dim)
+
+    fan_enc = ShallowFANEncoder(fdim, p_ratio=p_ratio, use_p_bias=use_p_bias)
+    fan_dec = ShallowFANDecoder(fdim, p_ratio=p_ratio, use_p_bias=use_p_bias)
+
+    mlp_ae = CapacityMatchedShallowMLPAutoencoder(
+        fdim,
+        p_ratio=p_ratio,
+        use_p_bias=use_p_bias,
+        block_activation=block_activation,
+        block_bias=block_bias,
+        verbose=False,
+    )
+    mlp_enc = mlp_ae.encoder
+    mlp_dec = mlp_ae.decoder
+
+    p_fan_enc = count_parameters(fan_enc)
+    p_fan_dec = count_parameters(fan_dec)
+    p_mlp_enc = count_parameters(mlp_enc)
+    p_mlp_dec = count_parameters(mlp_dec)
+
+    p_fan_layers = count_parameters(fan_enc.fan_layer1) + count_parameters(
+        fan_dec.fan_layer2
+    )
+    p_blocks = count_parameters(mlp_enc.block1) + count_parameters(mlp_dec.block2)
+
+    def pct(delta: int, base: int) -> float:
+        if base == 0:
+            return float("nan")
+        return 100.0 * (float(delta) / float(base))
+
+    out = {
+        "feature_dim": fdim,
+        "fan_encoder_params": p_fan_enc,
+        "fan_decoder_params": p_fan_dec,
+        "mlp_encoder_params": p_mlp_enc,
+        "mlp_decoder_params": p_mlp_dec,
+        "encoder_delta": p_mlp_enc - p_fan_enc,
+        "decoder_delta": p_mlp_dec - p_fan_dec,
+        "encoder_pct": pct(p_mlp_enc - p_fan_enc, p_fan_enc),
+        "decoder_pct": pct(p_mlp_dec - p_fan_dec, p_fan_dec),
+        "fan_layers_params": p_fan_layers,
+        "mlp_blocks_params": p_blocks,
+        "special_layers_delta": p_blocks - p_fan_layers,
+        "special_layers_pct": pct(p_blocks - p_fan_layers, p_fan_layers),
+        "fan_total": p_fan_enc + p_fan_dec,
+        "mlp_total": p_mlp_enc + p_mlp_dec,
+        "total_delta": (p_mlp_enc + p_mlp_dec) - (p_fan_enc + p_fan_dec),
+        "total_pct": pct(
+            (p_mlp_enc + p_mlp_dec) - (p_fan_enc + p_fan_dec),
+            (p_fan_enc + p_fan_dec),
+        ),
+        "mlp_hidden_dim": getattr(mlp_ae, "hidden_dim", None),
+    }
+
+    print(
+        "[validate_capacity_match] "
+        f"F={fdim} H={out['mlp_hidden_dim']} "
+        f"enc_delta={out['encoder_delta']} ({out['encoder_pct']:.3f}%) "
+        f"dec_delta={out['decoder_delta']} ({out['decoder_pct']:.3f}%) "
+        f"blocks_minus_fanlayers={out['special_layers_delta']} ({out['special_layers_pct']:.3f}%) "
+        f"total_delta={out['total_delta']} ({out['total_pct']:.3f}%)"
+    )
+    return out
+
+
+class ResidualFCBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        activation="relu",
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.hidden_dim = int(hidden_dim)
+        self.fc1 = nn.Linear(self.dim, self.hidden_dim, bias=bias)
+        self.fc2 = nn.Linear(self.hidden_dim, self.dim, bias=bias)
+
+        if isinstance(activation, str):
+            if activation.lower() == "relu":
+                self.activation = nn.ReLU()
+            elif activation.lower() == "gelu":
+                self.activation = nn.GELU()
+            elif activation.lower() == "tanh":
+                self.activation = nn.Tanh()
+            elif activation.lower() == "sigmoid":
+                self.activation = nn.Sigmoid()
+            else:
+                raise ValueError(f"Unsupported activation: {activation}")
+        else:
+            self.activation = activation if activation else nn.Identity()
+
+    def forward(self, x):
+        return x + self.fc2(self.activation(self.fc1(x)))
+
+
+class CapacityMatchedShallowMLPEncoder(nn.Module):
+    """Encoder counterpart to ShallowFANEncoder with capacity-matched MLP block."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        block_activation="relu",
+        block_bias: bool = True,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.bottleneck_dim = self.input_dim // 10
+        self.hidden_dim = int(hidden_dim)
+
+        self.Win = nn.Linear(self.input_dim, self.input_dim)
+        self.block1 = ResidualFCBlock(
+            self.input_dim,
+            self.hidden_dim,
+            activation=block_activation,
+            bias=block_bias,
+        )
+        self.fc1 = nn.Linear(self.input_dim, self.input_dim // 5)
+        self.fc2 = nn.Linear(self.input_dim // 5, self.bottleneck_dim)
+        self.activate = nn.ReLU()
+
+    def forward(self, x):
+        if x.dim() == 2:
+            out = self.Win(x)
+            out = self.block1(out)
+            out = self.fc1(out)
+            out = self.activate(out)
+            out = self.fc2(out)
+            out = self.activate(out)
+            return out
+        if x.dim() == 3:
+            b, t, f = x.shape
+            x2 = x.reshape(b * t, f)
+            z2 = self.forward(x2)
+            return z2.reshape(b, t, z2.shape[-1])
+        raise ValueError(f"Expected x shape [N, F] or [B, T, F]; got {tuple(x.shape)}")
+
+
+class CapacityMatchedShallowMLPDecoder(nn.Module):
+    """Decoder counterpart to ShallowFANDecoder with capacity-matched MLP block."""
+
+    def __init__(
+        self,
+        output_dim: int,
+        hidden_dim: int,
+        block_activation="relu",
+        block_bias: bool = True,
+    ):
+        super().__init__()
+        self.output_dim = int(output_dim)
+        self.hidden_dim = int(hidden_dim)
+        in_dim = self.output_dim // 10
+
+        self.fc3 = nn.Linear(in_dim, self.output_dim // 5)
+        self.fc4 = nn.Linear(self.output_dim // 5, self.output_dim)
+        self.block2 = ResidualFCBlock(
+            self.output_dim,
+            self.hidden_dim,
+            activation=block_activation,
+            bias=block_bias,
+        )
+        self.Wout = nn.Linear(self.output_dim, self.output_dim)
+        self.activate = nn.ReLU()
+
+    def forward(self, z):
+        if z.dim() == 2:
+            out = self.fc3(z)
+            out = self.activate(out)
+            out = self.fc4(out)
+            out = self.activate(out)
+            out = self.block2(out)
+            out = self.Wout(out)
+            return out
+        if z.dim() == 3:
+            b, t, l = z.shape
+            z2 = z.reshape(b * t, l)
+            x2 = self.forward(z2)
+            return x2.reshape(b, t, x2.shape[-1])
+        raise ValueError(f"Expected z shape [N, L] or [B, T, L]; got {tuple(z.shape)}")
+
+
+class CapacityMatchedShallowMLPAutoencoder(nn.Module):
+    """Capacity-matched MLP AE split into encoder/decoder objects."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int | None = None,
+        p_ratio: float = 0.45,
+        use_p_bias: bool = True,
+        block_activation="relu",
+        block_bias: bool = True,
+        verbose: bool = False,
+    ):
+        super().__init__()
+        if output_dim is None:
+            output_dim = input_dim
+        if int(input_dim) != int(output_dim):
+            raise ValueError(
+                "CapacityMatchedShallowMLPAutoencoder requires input_dim == output_dim"
+            )
+
+        fdim = int(input_dim)
+        fan1 = FANLayer(fdim, fdim, p_ratio=p_ratio, use_p_bias=use_p_bias)
+        fan2 = FANLayer(fdim, fdim, p_ratio=p_ratio, use_p_bias=use_p_bias)
+        p_fan_layers = count_parameters(fan1) + count_parameters(fan2)
+
+        def p_block(f: int, h: int, bias: bool) -> int:
+            if bias:
+                return 2 * f * h + (h + f)
+            return 2 * f * h
+
+        if block_bias:
+            denom = 4 * fdim + 2
+            h0 = int(max(1, round((p_fan_layers - 2 * fdim) / denom)))
+        else:
+            h0 = int(max(1, round(p_fan_layers / (4 * fdim))))
+
+        best_h = 1
+        best_delta = None
+        window = 256
+        lo = max(1, h0 - window)
+        hi = h0 + window
+        for h in range(lo, hi + 1):
+            approx = 2 * p_block(fdim, h, block_bias)
+            delta = abs(approx - p_fan_layers)
+            if (
+                best_delta is None
+                or delta < best_delta
+                or (delta == best_delta and h < best_h)
+            ):
+                best_delta = delta
+                best_h = h
+
+        self.hidden_dim = int(best_h)
+
+        self.encoder = CapacityMatchedShallowMLPEncoder(
+            fdim,
+            self.hidden_dim,
+            block_activation=block_activation,
+            block_bias=block_bias,
+        )
+        self.decoder = CapacityMatchedShallowMLPDecoder(
+            fdim,
+            self.hidden_dim,
+            block_activation=block_activation,
+            block_bias=block_bias,
+        )
+
+        if verbose:
+            p_total = count_parameters(self)
+            print(
+                "[CapacityMatchedShallowMLPAutoencoder] "
+                f"F={fdim} H={self.hidden_dim} total={p_total} "
+                f"fan_layers={p_fan_layers} blocks={count_parameters(self.encoder.block1) + count_parameters(self.decoder.block2)}"
+            )
 
     def forward(self, x):
         z = self.encoder(x)
@@ -389,3 +696,7 @@ class SINDySz(L.LightningModule):
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=0.001)
         return optimizer
+
+
+if __name__ == "__main__":
+    validate_capacity_match_shallow_mlp_vs_fan(50)
