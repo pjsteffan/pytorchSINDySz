@@ -465,6 +465,40 @@ def extract_imaginary_component(x):
     return torch.angle(pytorch_hilbert(x, axis=1))
 
 
+def reshape_time_to_feature_blocks(
+    x: torch.Tensor, time_dim: int = 500, block_size: int = 50
+):
+    """Reshape a [B, T] or [B, T, 1] time series to [B, T/block, block].
+
+    Assumes T == ``time_dim`` and splits the time dimension into evenly sized
+    blocks that become features at each (reduced) time step.
+    """
+
+    if x.dim() == 2:
+        b, t = x.shape
+        if t != time_dim:
+            raise ValueError(f"Expected time_dim={time_dim} for reshape, got {t}")
+        x = x.unsqueeze(-1)
+    elif x.dim() == 3:
+        b, t, f = x.shape
+        if f != 1:
+            raise ValueError(
+                "reshape_time_to_feature_blocks expects last dim == 1 when x.dim()==3"
+            )
+        if t != time_dim:
+            raise ValueError(f"Expected time_dim={time_dim} for reshape, got {t}")
+    else:
+        raise ValueError(f"Expected x with 2 or 3 dims, got {tuple(x.shape)}")
+
+    if time_dim % block_size != 0:
+        raise ValueError(
+            f"time_dim={time_dim} must be divisible by block_size={block_size}"
+        )
+
+    new_time = time_dim // block_size
+    return x.reshape(b, new_time, block_size)
+
+
 #
 # SINDy Model definitions
 #
@@ -580,6 +614,33 @@ class SINDyModel(nn.Module):
         jac_btlf = jac_diag.reshape(B, T, self.latent_features, F)
         return jac_btlf
 
+    def compute_jacobian_x_wrt_z(self, z):
+        """Compute per-example Jacobian ∂x/∂z for batched latents.
+
+        Args:
+            z (Tensor): shape [B, T, latent_features]
+        Returns:
+            Tensor: Jacobian of shape [B, T, system_features, latent_features]
+        """
+
+        B, T, L = z.shape
+        z_flat = z.reshape(-1, L)
+
+        def decoder_flat(z_in):
+            # z_in shape [B*T, L]; returns [B*T, F]
+            return self.decoder(z_in)
+
+        jac = torch.autograd.functional.jacobian(
+            decoder_flat,
+            z_flat,
+            vectorize=True,
+            create_graph=True,
+        )  # shape [B*T, F, B*T, L]
+
+        jac_diag = jac.diagonal(dim1=0, dim2=2)  # [B*T, F, L]
+        jac_btfl = jac_diag.reshape(B, T, self.system_features, L)
+        return jac_btfl
+
     def forward(self, x):
         """Forward pass for batched sequences.
 
@@ -597,7 +658,7 @@ class SINDyModel(nn.Module):
             )
 
         assert x.dim() == 3, "Expected x shape [B, T, F] or [B, T] (auto-unsqueezed)"
-        assert x.size(1) == self.time_dim, "Time dimension mismatch"
+        # assert x.size(1) == self.time_dim, "Time dimension mismatch"
 
         param_dtype = next(self.parameters()).dtype
         if x.dtype != param_dtype:
@@ -606,16 +667,18 @@ class SINDyModel(nn.Module):
         x = x.requires_grad_(True)
 
         # Encoder/decoder act on the feature dimension (last dim) and are batch/time agnostic
-        z = self.encoder(x)  # [B, T, latent_features]
+        z = self.encoder(x).requires_grad_(True)  # [B, T, latent_features]
         theta_x = self.compute_library(z)  # [B, T, library_dim]
         y_hat = self.SINDy_predict(theta_x)  # [B, T, latent_features]
         x_hat = self.decoder(z)  # [B, T, system_features]
 
         # Per-example Jacobian ∂z/∂x: [B, T, L, F]
         jac_z_x = self.compute_jacobian_z_wrt_x(x)
+        # Per-example Jacobian ∂x/∂z: [B, T, F, L]
+        jac_x_z = self.compute_jacobian_x_wrt_z(z)
 
         # Return weights needed for loss computations (constant across batch/time)
-        return y_hat, x_hat, z, jac_z_x, self.SINDy_predict.weight, self.decoder.weight
+        return y_hat, x_hat, z, jac_z_x, jac_x_z, self.SINDy_predict.weight
 
 
 class SINDyLoss(nn.Module):
@@ -626,7 +689,7 @@ class SINDyLoss(nn.Module):
         self.lambda3 = 1.0  # SINDy regularization loss
         self.lambda4 = 1.0  # z_dot via autograd Jacobian
 
-    def forward(self, x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight):
+    def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy loss.
 
         Args:
@@ -635,8 +698,8 @@ class SINDyLoss(nn.Module):
             x_hat: [B, T, F]
             z: [B, T, L]
             jac_z_x: [B, T, L, F]
+            jac_x_z: [B, T, F, L]
             SINDy_weights: [L, library_dim]
-            decoder_weight: [F, L]
         Returns:
             scalar loss
         """
@@ -648,9 +711,10 @@ class SINDyLoss(nn.Module):
         z_dot = torch.diff(z, dim=1)  # [B, T-1, L]
         y_hat_trim = y_hat[:, :-1, :]  # align to T-1
         jac_trim = jac_z_x[:, :-1, :, :]  # [B, T-1, L, F]
+        jac_xz_trim = jac_x_z[:, :-1, :, :]  # [B, T-1, F, L]
 
         # Predicted x_dot from y_hat via decoder Jacobian
-        x_dot_pred = torch.einsum("btl,fl->btf", y_hat_trim, decoder_weight)
+        x_dot_pred = torch.einsum("btfl,btl->btf", jac_xz_trim, y_hat_trim)
 
         # z_dot predicted via autograd Jacobian * x_dot
         z_dot_pred = torch.einsum("btlf,btf->btl", jac_trim, x_dot)
@@ -720,33 +784,27 @@ class SINDySz(L.LightningModule):
     def training_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
-            x = x.unsqueeze(-1)
-        y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(
-            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
-        )
+            x = reshape_time_to_feature_blocks(x)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
-            x = x.unsqueeze(-1)
-        y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(
-            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
-        )
+            x = reshape_time_to_feature_blocks(x)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("validation_loss", loss)
         return loss
 
     def test_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
-            x = x.unsqueeze(-1)
-        y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight = self.forward(x)
-        loss = self.criterion(
-            x, y_hat, x_hat, z, jac_z_x, SINDy_weights, decoder_weight
-        )
+            x = reshape_time_to_feature_blocks(x)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("test_loss", loss)
         return loss
 
