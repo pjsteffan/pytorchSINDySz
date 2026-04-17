@@ -47,7 +47,7 @@ def main(data_file, annotation_file, sample_rate=5000):
     valid_loader = DataLoader(valid_set, batch_size=9)
     test_loader = DataLoader(test_set, batch_size=9)
 
-    time_dim = 500
+    time_dim = 10
     system_features = 50
     latent_features = 5
     poly_order = 2
