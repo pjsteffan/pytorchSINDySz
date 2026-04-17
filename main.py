@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.utils.data as data
 import torch
 import lightning as L
+from lightning.pytorch.callbacks import EarlyStopping
 
 
 def main(data_file, annotation_file, sample_rate=5000):
@@ -16,7 +17,7 @@ def main(data_file, annotation_file, sample_rate=5000):
     dataset = WRsmallepoch(
         data_file=data_file,
         annotation_file=annotation_file,
-        single_channel_flag=False,
+        single_channel_flag=True,
         psd_flag=False,
         epoch_id_restriction=2.0,
         epoch_size=5.0,
@@ -47,8 +48,8 @@ def main(data_file, annotation_file, sample_rate=5000):
     test_loader = DataLoader(test_set, batch_size=9)
 
     time_dim = 500
-    system_features = 2
-    latent_features = 4
+    system_features = 50
+    latent_features = 5
     poly_order = 2
     batch_size = 2
 
@@ -77,12 +78,17 @@ def main(data_file, annotation_file, sample_rate=5000):
             lr=0.001,
         ).to(torch.get_default_dtype())
 
+        early_stopping = EarlyStopping(monitor="valid_loss", min_delta=0.001, patience=3, check_on_train_epoch_end=False)
+
+
         trainer = L.Trainer(
             max_epochs=10,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
             default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_runs/{name}",
+            callbacks=[early_stopping],
+            fast_dev_run=True,
             logger=True,
         )
         trainer.fit(sindy_sz, train_loader, valid_loader)
