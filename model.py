@@ -684,10 +684,10 @@ class SINDyModel(nn.Module):
 class SINDyLoss(nn.Module):
     def __init__(self):
         super(SINDyLoss, self).__init__()
-        self.lambda1 = 1.0  # SINDy loss in x_dot
-        self.lambda2 = 1.0  # SINDy loss in z_dot
+        self.lambda1 = 1.0  # SINDy reconstruction loss
+        self.lambda2 = 1.0  # SINDy loss in x_dot
         self.lambda3 = 1.0  # SINDy regularization loss
-        self.lambda4 = 1.0  # z_dot via autograd Jacobian
+        self.lambda4 = 1.0  # SINDy loss in z_dot
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy loss.
@@ -796,7 +796,7 @@ class SINDySz(L.LightningModule):
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
         loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
-        self.log("validation_loss", loss)
+        self.log("valid_loss", loss)
         return loss
 
     def test_step(self, batch, batch_idx):
@@ -809,11 +809,12 @@ class SINDySz(L.LightningModule):
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
+        
         # Prune small SINDy weights after optimizer step so zeros persist into next iteration
         with torch.no_grad():
             weight = self.model.SINDy_predict.weight
-            weight.masked_fill_(weight.abs() < 1e-3, 0.0)
-
+            weight.masked_fill_(weight.abs() < 1e-2, 0.0)
+        
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
         return optimizer

@@ -19,7 +19,7 @@ def main(data_file, annotation_file, sample_rate=5000):
         annotation_file=annotation_file,
         single_channel_flag=True,
         psd_flag=False,
-        epoch_id_restriction=2.0,
+        epoch_id_restriction=None,
         epoch_size=5.0,
         sample_rate=sample_rate,
     )
@@ -75,20 +75,20 @@ def main(data_file, annotation_file, sample_rate=5000):
             poly_order=poly_order,
             encoder=ae.encoder,
             decoder=ae.decoder,
-            lr=0.001,
+            lr=0.0001,
         ).to(torch.get_default_dtype())
 
         early_stopping = EarlyStopping(monitor="valid_loss", min_delta=0.001, patience=3, check_on_train_epoch_end=False)
 
 
         trainer = L.Trainer(
-            max_epochs=10,
+            max_epochs=100,
             log_every_n_steps=10,
             accelerator="gpu",
             devices=1,
-            default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_runs/{name}",
+            default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_logs/{name}",
             callbacks=[early_stopping],
-            fast_dev_run=True,
+            fast_dev_run=False,
             logger=True,
         )
         trainer.fit(sindy_sz, train_loader, valid_loader)
