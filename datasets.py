@@ -67,7 +67,7 @@ class WRsmallepoch(Dataset):
             
             ch1_data = self.downsample(ch1_data, original_fs=self.sample_rate, target_fs=100)
             ch1_data = self.filter_data(ch1_data, lowcut=5, highcut=30, fs=100.0, order=5)
-            ch1_data = (ch1_data - ch1_mean) / (ch1_std + 1e-10)
+            ch1_data = (ch1_data - ch1_mean) / (ch1_std + 1e-6)
             if self.psd_flag:
                 _, ch1_data = self.power_spectrum(ch1_data, fs=100.0)
             data_tensor = torch.as_tensor(ch1_data.copy(), dtype=torch.get_default_dtype())

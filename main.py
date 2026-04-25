@@ -75,7 +75,8 @@ def main(data_file, annotation_file, sample_rate=5000):
             poly_order=poly_order,
             encoder=ae.encoder,
             decoder=ae.decoder,
-            lr=0.001,
+            lr=0.0001,
+            nan_check=True,
         ).to(torch.get_default_dtype())
 
         early_stopping = EarlyStopping(monitor="valid_loss", min_delta=0.001, patience=3, check_on_train_epoch_end=False)
