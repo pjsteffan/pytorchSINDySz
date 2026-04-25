@@ -762,7 +762,7 @@ class SINDyModel(nn.Module):
             encoder_flat,
             x_flat,
             vectorize=True,
-            create_graph=True,
+            create_graph=False,
         )  # shape [B*T, L, B*T, F]
 
         if self.nan_check and self.nan_check_level == "full":
@@ -800,7 +800,7 @@ class SINDyModel(nn.Module):
             decoder_flat,
             z_flat,
             vectorize=True,
-            create_graph=True,
+            create_graph=False,
         )  # shape [B*T, F, B*T, L]
 
         if self.nan_check and self.nan_check_level == "full":
