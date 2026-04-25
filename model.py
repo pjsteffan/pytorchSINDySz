@@ -8,6 +8,26 @@ from itertools import combinations_with_replacement
 import numpy as np
 
 
+def equal_var_init(model: nn.Module) -> None:
+    """Equal-variance init for Linear/GRU-style params.
+
+    - Biases -> 0
+    - Everything else -> Normal(0, 1/sqrt(fan_in))
+    """
+
+    import math
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith(".bias") or ".gru.bias" in name:
+            param.data.fill_(0)
+        else:
+            # Expect weight-like tensors to be [..., fan_in]
+            fan_in = int(param.shape[-1])
+            param.data.normal_(std=1.0 / math.sqrt(fan_in))
+
+
 class FANLayer(nn.Module):
     """FAN layer from https://arxiv.org/abs/2410.02675.
 
@@ -684,10 +704,10 @@ class SINDyModel(nn.Module):
 class SINDyLoss(nn.Module):
     def __init__(self):
         super(SINDyLoss, self).__init__()
-        self.lambda1 = 1.0  # SINDy reconstruction loss
-        self.lambda2 = 1.0  # SINDy loss in x_dot
-        self.lambda3 = 1.0  # SINDy regularization loss
-        self.lambda4 = 1.0  # SINDy loss in z_dot
+        self.lambda1 = 0.1
+        self.lambda2 = 0.1
+        self.lambda3 = 10
+        self.lambda4 = 0.1
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy loss.
@@ -703,8 +723,6 @@ class SINDyLoss(nn.Module):
         Returns:
             scalar loss
         """
-        # Reconstruction over all time steps
-        loss = F.mse_loss(x_hat, x)
 
         # Finite differences along time dimension
         x_dot = torch.diff(x, dim=1)  # [B, T-1, F]
@@ -719,11 +737,22 @@ class SINDyLoss(nn.Module):
         # z_dot predicted via autograd Jacobian * x_dot
         z_dot_pred = torch.einsum("btlf,btf->btl", jac_trim, x_dot)
 
-        loss += self.lambda1 * F.mse_loss(x_dot_pred, x_dot)
-        loss += self.lambda2 * F.mse_loss(y_hat_trim, z_dot)
-        loss += self.lambda4 * F.mse_loss(z_dot_pred, z_dot)
-        loss += self.lambda3 * SINDy_weights.abs().sum()
-        return loss
+        recon_loss = self.lambda1 * F.mse_loss(x, x_hat)
+        sindy_loss_xdot = self.lambda2 * F.mse_loss(x_dot, x_dot_pred)
+        sindy_loss_zdot = self.lambda3 * F.mse_loss(z_dot_pred, y_hat_trim)
+        sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
+
+        total_loss = (
+            recon_loss + sindy_loss_xdot + sindy_loss_zdot + sindy_regularization
+        )
+
+        return (
+            total_loss,
+            recon_loss,
+            sindy_loss_xdot,
+            sindy_loss_zdot,
+            sindy_regularization,
+        )
 
 
 #
@@ -778,6 +807,8 @@ class SINDySz(L.LightningModule):
         self.criterion = SINDyLoss()
         self.lr = float(lr)
 
+        equal_var_init(self.model)
+
     def forward(self, x):
         return self.model(x)
 
@@ -786,8 +817,14 @@ class SINDySz(L.LightningModule):
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
-        self.log("train_loss", loss)
+        loss, recon_loss, sindy_loss_xdot, sindy_loss_zdot, sindy_regularization = (
+            self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        )
+        self.log("train_total_loss", loss)
+        self.log("train_recon_loss", recon_loss)
+        self.log("train_sindyxdot_loss", sindy_loss_xdot)
+        self.log("train_sindyzdot_loss", sindy_loss_zdot)
+        self.log("train_sindyreg_loss", sindy_regularization)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -795,7 +832,9 @@ class SINDySz(L.LightningModule):
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        loss, _, _, _, _ = self.criterion(
+            x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
+        )
         self.log("valid_loss", loss)
         return loss
 
@@ -804,17 +843,19 @@ class SINDySz(L.LightningModule):
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        loss, _, _, _, _ = self.criterion(
+            x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
+        )
         self.log("test_loss", loss)
         return loss
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        
+
         # Prune small SINDy weights after optimizer step so zeros persist into next iteration
         with torch.no_grad():
             weight = self.model.SINDy_predict.weight
-            weight.masked_fill_(weight.abs() < 1e-2, 0.0)
-        
+            weight.data.masked_fill_(weight.abs() < 1e-8, 0.0)
+
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.lr)
         return optimizer

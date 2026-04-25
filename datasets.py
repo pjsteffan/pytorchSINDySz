@@ -62,9 +62,12 @@ class WRsmallepoch(Dataset):
         if self.single_channel_flag:
             with h5py.File(self.data_file, 'r') as f:
                 ch1_data = f['Ch.1'][start_index:int(start_index+self.epoch_num_samples)]
+                ch1_mean = f['Ch.1'].attrs['mean']
+                ch1_std = f['Ch.1'].attrs['std']
             
             ch1_data = self.downsample(ch1_data, original_fs=self.sample_rate, target_fs=100)
             ch1_data = self.filter_data(ch1_data, lowcut=5, highcut=30, fs=100.0, order=5)
+            ch1_data = (ch1_data - ch1_mean) / (ch1_std + 1e-10)
             if self.psd_flag:
                 _, ch1_data = self.power_spectrum(ch1_data, fs=100.0)
             data_tensor = torch.as_tensor(ch1_data.copy(), dtype=torch.get_default_dtype())
