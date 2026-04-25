@@ -90,6 +90,7 @@ def main(data_file, annotation_file, sample_rate=5000):
             default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_logs/{name}",
             callbacks=[early_stopping],
             fast_dev_run=False,
+            gradient_clip_val=0.5,
             logger=True,
         )
         trainer.fit(sindy_sz, train_loader, valid_loader)
