@@ -965,7 +965,7 @@ class SINDyLoss(nn.Module):
         self.lambda4 = 0.01
         self.nan_check = bool(nan_check)
 
-    def apply_finite_difference(
+    def apply_finite_difference_batch(
         self,
         x: torch.Tensor,
         z: torch.Tensor,
@@ -1052,8 +1052,8 @@ class SINDyLoss(nn.Module):
             check_finite(SINDy_weights, "loss/SINDy_weights")
 
         # Finite differences along time dimension (no trimming needed)
-        x_dot, z_dot = self.apply_finite_difference(
-            x, z, time_dim=1
+        x_dot, z_dot = self.apply_finite_difference_batch(
+            x, z, time_dim=1, fs=100
         )  # [B, T, F], [B, T, L]
         y_hat_trim = y_hat
         jac_trim = jac_z_x
@@ -1160,6 +1160,42 @@ class SINDySz(L.LightningModule):
         self.lr = float(lr)
 
         equal_var_init(self.model)
+
+    def apply_finite_difference(self, filtered_data, fs):
+        """Compute first derivative via finite differences (NumPy).
+
+        Supports:
+        - 1D input: [T]
+        - 2D batched input: [B, T]
+
+        Uses forward/backward differences at boundaries and central differences
+        in the interior. Output has the same shape as input.
+        """
+
+        filtered_data = np.asarray(filtered_data)
+        if filtered_data.ndim not in (1, 2):
+            raise ValueError(
+                f"filtered_data must be 1D [T] or 2D [B,T]; got shape {filtered_data.shape}"
+            )
+
+        dt = 1.0 / float(fs)
+
+        if filtered_data.shape[-1] < 2:
+            raise ValueError("filtered_data must contain at least two samples")
+
+        deriv = np.empty_like(filtered_data, dtype=float)
+
+        if filtered_data.ndim == 1:
+            deriv[0] = (filtered_data[1] - filtered_data[0]) / dt
+            deriv[-1] = (filtered_data[-1] - filtered_data[-2]) / dt
+            deriv[1:-1] = (filtered_data[2:] - filtered_data[:-2]) / (2.0 * dt)
+            return deriv
+
+        # filtered_data: [B, T]
+        deriv[:, 0] = (filtered_data[:, 1] - filtered_data[:, 0]) / dt
+        deriv[:, -1] = (filtered_data[:, -1] - filtered_data[:, -2]) / dt
+        deriv[:, 1:-1] = (filtered_data[:, 2:] - filtered_data[:, :-2]) / (2.0 * dt)
+        return deriv
 
     def forward(self, x):
         return self.model(x)
