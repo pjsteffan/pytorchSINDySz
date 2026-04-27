@@ -871,14 +871,161 @@ class SINDyModel(nn.Module):
         return y_hat, x_hat, z, jac_z_x, jac_x_z, self.SINDy_predict.weight
 
 
+class noSINDy(nn.Module):
+    """Autoencoder-only variant of SINDyModel.
+
+    Preserves the same encoder/decoder behavior and dtype handling as SINDyModel,
+    but skips all SINDy-specific computations (library, predictor, Jacobians).
+
+    Expected input shape: [batch, time_dim, system_features].
+    """
+
+    def __init__(
+        self,
+        time_dim: int,
+        system_features: int,
+        latent_features: int,
+        *,
+        encoder: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+        nan_check: bool = False,
+        nan_check_level: str = "basic",
+    ):
+        super().__init__()
+        self.time_dim = time_dim
+        self.system_features = system_features
+        self.latent_features = latent_features
+
+        self.nan_check = bool(nan_check)
+        self.nan_check_level = str(nan_check_level).lower()
+        if self.nan_check_level not in {"off", "basic", "full"}:
+            raise ValueError(
+                "nan_check_level must be one of: off, basic, full; "
+                f"got {nan_check_level!r}"
+            )
+
+        # Match SINDyModel defaults.
+        self.encoder = (
+            encoder
+            if encoder is not None
+            else nn.Linear(system_features, latent_features)  # Example encoder
+        )
+        self.decoder = (
+            decoder
+            if decoder is not None
+            else nn.Linear(latent_features, system_features)
+        )
+
+    def forward(self, x: torch.Tensor):
+        """Forward pass for batched sequences.
+
+        Args:
+            x (Tensor): shape [B, T, system_features]
+        Returns:
+            tuple: (x_hat, z)
+                x_hat: reconstruction, [B, T, system_features]
+                z: latent states, [B, T, latent_features]
+        """
+
+        if x.dim() != 3:
+            raise ValueError(
+                f"Expected x shape [B, T, F] or [B, T]; got {tuple(x.shape)}"
+            )
+
+        assert x.dim() == 3, "Expected x shape [B, T, F] or [B, T] (auto-unsqueezed)"
+
+        param_dtype = next(self.parameters()).dtype
+        if x.dtype != param_dtype:
+            x = x.to(param_dtype)
+
+        if self.nan_check and self.nan_check_level != "off":
+            check_finite(x, "forward/x")
+            check_module_params_finite(self.encoder, "forward/encoder")
+
+        # Keep requires_grad behavior aligned with SINDyModel.
+        x = x.requires_grad_(True)
+
+        z = self.encoder(x).requires_grad_(True)  # [B, T, latent_features]
+        if self.nan_check and self.nan_check_level != "off":
+            check_finite(z, "forward/z")
+
+        x_hat = self.decoder(z)  # [B, T, system_features]
+        if self.nan_check and self.nan_check_level != "off":
+            check_finite(x_hat, "forward/x_hat")
+
+        return x_hat, z
+
+
 class SINDyLoss(nn.Module):
     def __init__(self, *, nan_check: bool = False):
         super(SINDyLoss, self).__init__()
         self.lambda1 = 0.1
         self.lambda2 = 0.1
-        self.lambda3 = 1
-        self.lambda4 = 0.1
+        self.lambda3 = 0.1
+        self.lambda4 = 0.01
         self.nan_check = bool(nan_check)
+
+    def apply_finite_difference(
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        *,
+        dt: float | None = None,
+        fs: float | None = None,
+        time_dim: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Batch-aware first derivatives via finite differences.
+
+        Computes derivatives along the time axis using forward/backward
+        differences at the boundaries and central differences in the interior.
+
+        Args:
+            x: Tensor [B, T, F]
+            z: Tensor [B, T, L]
+            dt: time step in seconds (preferred)
+            fs: sampling frequency in Hz (used if dt is None)
+            time_dim: time dimension (default 1)
+
+        Returns:
+            (x_dot, z_dot) with shapes [B, T, F] and [B, T, L]
+        """
+
+        if dt is None:
+            if fs is None:
+                dt = 1.0
+            else:
+                dt = 1.0 / float(fs)
+        else:
+            dt = float(dt)
+
+        if x.dim() != 3 or z.dim() != 3:
+            raise ValueError(
+                f"Expected x [B,T,F] and z [B,T,L]; got x={tuple(x.shape)} z={tuple(z.shape)}"
+            )
+        if x.shape[0] != z.shape[0] or x.shape[1] != z.shape[1]:
+            raise ValueError(
+                f"Batch/time dims must match; got x={tuple(x.shape)} z={tuple(z.shape)}"
+            )
+
+        T = int(x.shape[time_dim])
+        if T < 2:
+            raise ValueError("Need at least two time steps for finite differences")
+
+        def fd(t: torch.Tensor) -> torch.Tensor:
+            # t: [B, T, C] (with time_dim==1) -> out same shape
+            if time_dim != 1:
+                t = t.transpose(time_dim, 1)
+
+            out = torch.empty_like(t)
+            out[:, 0, :] = (t[:, 1, :] - t[:, 0, :]) / dt
+            out[:, -1, :] = (t[:, -1, :] - t[:, -2, :]) / dt
+            out[:, 1:-1, :] = (t[:, 2:, :] - t[:, :-2, :]) / (2.0 * dt)
+
+            if time_dim != 1:
+                out = out.transpose(time_dim, 1)
+            return out
+
+        return fd(x), fd(z)
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy loss.
@@ -904,12 +1051,13 @@ class SINDyLoss(nn.Module):
             check_finite(jac_x_z, "loss/jac_x_z")
             check_finite(SINDy_weights, "loss/SINDy_weights")
 
-        # Finite differences along time dimension
-        x_dot = torch.diff(x, dim=1)  # [B, T-1, F]
-        z_dot = torch.diff(z, dim=1)  # [B, T-1, L]
-        y_hat_trim = y_hat[:, :-1, :]  # align to T-1
-        jac_trim = jac_z_x[:, :-1, :, :]  # [B, T-1, L, F]
-        jac_xz_trim = jac_x_z[:, :-1, :, :]  # [B, T-1, F, L]
+        # Finite differences along time dimension (no trimming needed)
+        x_dot, z_dot = self.apply_finite_difference(
+            x, z, time_dim=1
+        )  # [B, T, F], [B, T, L]
+        y_hat_trim = y_hat
+        jac_trim = jac_z_x
+        jac_xz_trim = jac_x_z
 
         if self.nan_check:
             check_finite(x_dot, "loss/x_dot")
@@ -1068,7 +1216,86 @@ class SINDySz(L.LightningModule):
             check_module_params_finite(self.model.encoder, "post_step/encoder")
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = optim.AdamW(self.parameters(), lr=self.lr)
+        return optimizer
+
+
+class noSINDySz(L.LightningModule):
+    """PyTorch Lightning module for training noSINDy (AE-only).
+
+    Logs reconstruction loss only.
+    """
+
+    def __init__(
+        self,
+        model: noSINDy | None = None,
+        *,
+        time_dim: int | None = None,
+        system_features: int | None = None,
+        latent_features: int | None = None,
+        encoder: nn.Module | None = None,
+        decoder: nn.Module | None = None,
+        lr: float = 0.001,
+        nan_check: bool = False,
+        nan_check_level: str = "basic",
+    ):
+        super().__init__()
+
+        if model is None:
+            missing = [
+                name
+                for name, val in (
+                    ("time_dim", time_dim),
+                    ("system_features", system_features),
+                    ("latent_features", latent_features),
+                )
+                if val is None
+            ]
+            if missing:
+                raise TypeError(
+                    "noSINDySz requires either `model` or all of: "
+                    "time_dim, system_features, latent_features. "
+                    f"Missing: {', '.join(missing)}"
+                )
+            model = noSINDy(
+                time_dim=time_dim,
+                system_features=system_features,
+                latent_features=latent_features,
+                encoder=encoder,
+                decoder=decoder,
+                nan_check=nan_check,
+                nan_check_level=nan_check_level,
+            )
+
+        self.model = model
+        self.lr = float(lr)
+        self.nan_check = bool(nan_check)
+
+        equal_var_init(self.model)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def _shared_step(self, batch, stage: str):
+        x = batch[0] if isinstance(batch, (tuple, list)) else batch
+        if x.dim() == 2:  # allow [B, T] by treating it as single-feature
+            x = reshape_time_to_feature_blocks(x)
+        x_hat, z = self.forward(x)
+        recon_loss = F.mse_loss(x, x_hat)
+        self.log(f"{stage}_recon_loss", recon_loss)
+        return recon_loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, "train")
+
+    def validation_step(self, batch, batch_idx):
+        return self._shared_step(batch, "valid")
+
+    def test_step(self, batch, batch_idx):
+        return self._shared_step(batch, "test")
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(self.parameters(), lr=self.lr)
         return optimizer
 
 
