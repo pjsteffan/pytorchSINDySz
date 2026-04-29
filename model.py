@@ -216,7 +216,7 @@ class ShallowFANDecoder(nn.Module):
         return out
 
 
-class ShallowFANAutoencoder(nn.Module):
+class ShallowFANGRUAutoencoder(nn.Module):
     """shallowFAN split into encoder/decoder.
 
     Matches the original shallowFAN_Sz architecture and enforces input_dim == output_dim
