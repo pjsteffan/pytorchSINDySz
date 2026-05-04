@@ -164,10 +164,25 @@ class FANLayer(nn.Module):
         return torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
 
 
-class ShallowFANEncoder(nn.Module):
-    """Encoder portion of shallowFAN_Sz: Win -> FAN -> fc1 -> ReLU -> fc2 -> ReLU."""
 
-    def __init__(self, input_dim, p_ratio=0.45, use_p_bias=True):
+
+class ShallowFANGRUEncoder(nn.Module):
+    """Encoder that replaces the MLP bottleneck with a GRU.
+
+    Original: Win -> FAN -> fc1 -> ReLU -> fc2 -> ReLU
+    New:      Win -> FAN -> GRU -> Linear(proj to bottleneck)
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        p_ratio: float = 0.45,
+        use_p_bias: bool = True,
+        *,
+        gru_hidden_dim: int | None = None,
+        gru_layers: int = 1,
+        bidirectional: bool = False,
+    ):
         super().__init__()
         self.input_dim = int(input_dim)
         self.bottleneck_dim = self.input_dim // 10
@@ -176,40 +191,85 @@ class ShallowFANEncoder(nn.Module):
         self.fan_layer1 = FANLayer(
             self.input_dim, self.input_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
         )
-        self.fc1 = nn.Linear(self.input_dim, self.input_dim // 5)
-        self.fc2 = nn.Linear(self.input_dim // 5, self.bottleneck_dim)
+
+        if gru_hidden_dim is None:
+            gru_hidden_dim = max(1, self.input_dim // 5)
+        self.gru_hidden_dim = int(gru_hidden_dim)
+
+        self.gru = nn.GRU(
+            input_size=self.input_dim,
+            hidden_size=self.gru_hidden_dim,
+            num_layers=int(gru_layers),
+            batch_first=True,
+            bidirectional=bool(bidirectional),
+        )
+
+        gru_out_dim = self.gru_hidden_dim * (2 if bidirectional else 1)
+        self.proj = nn.Linear(gru_out_dim, self.bottleneck_dim)
         self.activate = nn.ReLU()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
         out = self.Win(x)
         out = self.fan_layer1(out)
-        out = self.fc1(out)
-        out = self.activate(out)
-        out = self.fc2(out)
+        out, _ = self.gru(out)
+        out = self.proj(out)
         out = self.activate(out)
         return out
 
 
-class ShallowFANDecoder(nn.Module):
-    """Decoder portion of shallowFAN_Sz: fc3 -> ReLU -> fc4 -> ReLU -> FAN -> Wout."""
 
-    def __init__(self, output_dim, p_ratio=0.45, use_p_bias=True):
+class ShallowFANGRUDecoder(nn.Module):
+    """Decoder that replaces the MLP expander with a GRU.
+
+    Original: fc3 -> ReLU -> fc4 -> ReLU -> FAN -> Wout
+    New:      Linear(up-proj) -> ReLU -> GRU -> FAN -> Wout
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        p_ratio: float = 0.45,
+        use_p_bias: bool = True,
+        *,
+        gru_hidden_dim: int | None = None,
+        gru_layers: int = 1,
+        bidirectional: bool = False,
+    ):
         super().__init__()
         self.output_dim = int(output_dim)
-
         in_dim = self.output_dim // 10
-        self.fc3 = nn.Linear(in_dim, self.output_dim // 5)
-        self.fc4 = nn.Linear(self.output_dim // 5, self.output_dim)
+
+        if gru_hidden_dim is None:
+            gru_hidden_dim = max(1, self.output_dim // 5)
+        self.gru_hidden_dim = int(gru_hidden_dim)
+
+        # First expand from bottleneck to a reasonable working width.
+        self.fc_in = nn.Linear(in_dim, self.output_dim)
+        self.activate = nn.ReLU()
+
+        self.gru = nn.GRU(
+            input_size=self.output_dim,
+            hidden_size=self.gru_hidden_dim,
+            num_layers=int(gru_layers),
+            batch_first=True,
+            bidirectional=bool(bidirectional),
+        )
+
+        gru_out_dim = self.gru_hidden_dim * (2 if bidirectional else 1)
+        self.fc_out = nn.Linear(gru_out_dim, self.output_dim)
+
         self.fan_layer2 = FANLayer(
             self.output_dim, self.output_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
         )
         self.Wout = nn.Linear(self.output_dim, self.output_dim)
-        self.activate = nn.ReLU()
 
-    def forward(self, z):
-        out = self.fc3(z)
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [B, T, bottleneck]
+        out = self.fc_in(z)
         out = self.activate(out)
-        out = self.fc4(out)
+        out, _ = self.gru(out)
+        out = self.fc_out(out)
         out = self.activate(out)
         out = self.fan_layer2(out)
         out = self.Wout(out)
@@ -223,7 +283,18 @@ class ShallowFANGRUAutoencoder(nn.Module):
     due to the original implicit dimension coupling.
     """
 
-    def __init__(self, input_dim, output_dim=None, p_ratio=0.45, use_p_bias=True):
+    def __init__(
+        self,
+        input_dim,
+        output_dim=None,
+        p_ratio=0.45,
+        use_p_bias=True,
+        *,
+        encoder_gru_hidden_dim: int | None = None,
+        decoder_gru_hidden_dim: int | None = None,
+        gru_layers: int = 1,
+        bidirectional: bool = False,
+    ):
         super().__init__()
         if output_dim is None:
             output_dim = input_dim
@@ -233,11 +304,21 @@ class ShallowFANGRUAutoencoder(nn.Module):
         self.input_dim = int(input_dim)
         self.output_dim = int(output_dim)
 
-        self.encoder = ShallowFANEncoder(
-            self.input_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        self.encoder = ShallowFANGRUEncoder(
+            self.input_dim,
+            p_ratio=p_ratio,
+            use_p_bias=use_p_bias,
+            gru_hidden_dim=encoder_gru_hidden_dim,
+            gru_layers=gru_layers,
+            bidirectional=bidirectional,
         )
-        self.decoder = ShallowFANDecoder(
-            self.output_dim, p_ratio=p_ratio, use_p_bias=use_p_bias
+        self.decoder = ShallowFANGRUDecoder(
+            self.output_dim,
+            p_ratio=p_ratio,
+            use_p_bias=use_p_bias,
+            gru_hidden_dim=decoder_gru_hidden_dim,
+            gru_layers=gru_layers,
+            bidirectional=bidirectional,
         )
 
     def forward(self, x):
