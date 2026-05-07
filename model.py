@@ -539,28 +539,32 @@ class SINDyModel(nn.Module):
             Tensor: Jacobian of shape [B, T, latent_features, F]
         """
         B, T, feat_dim = x.shape
-        x_flat = x.reshape(-1, feat_dim)
 
         if self.nan_check and self.nan_check_level != "off":
             check_finite(x, "jac_z_x/x")
 
-        def encoder_flat(x_in):
-            # x_in shape [B*T, F]; returns [B*T, L]
+        def encoder_bt(x_in: torch.Tensor) -> torch.Tensor:
+            # x_in: [B, T, F] -> z: [B, T, L]
             return self.encoder(x_in)
 
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
+        # Shape: [B, T, L, B, T, F]
         jac = torch.autograd.functional.jacobian(
-            encoder_flat,
-            x_flat,
+            encoder_bt,
+            x,
             vectorize=True,
             create_graph=False,
-        )  # shape [B*T, L, B*T, F]
+        )
 
         if self.nan_check and self.nan_check_level == "full":
             check_finite(jac, "jac_z_x/raw")
 
-        # take per-sample diagonal across the two batch/time axes
-        jac_diag = jac.diagonal(dim1=0, dim2=2).permute(2, 0, 1)  # [B*T, L, F]
-        jac_btlf = jac_diag.reshape(B, T, self.latent_features, feat_dim)
+        # Select the per-(b,t) block diagonal: ∂z[b,t,:] / ∂x[b,t,:]
+        # First diagonal picks matching batch index -> [T, L, T, F, B]
+        # Second diagonal picks matching time index  -> [L, F, B, T]
+        # Permute to [B, T, L, F]
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=3)
+        jac_btlf = jac_diag.permute(2, 3, 0, 1).contiguous()
 
         if self.nan_check and self.nan_check_level != "off":
             check_finite(jac_btlf, "jac_z_x/out")
@@ -577,27 +581,30 @@ class SINDyModel(nn.Module):
 
         B, T, lat_dim = z.shape
         L = lat_dim
-        z_flat = z.reshape(-1, L)
 
         if self.nan_check and self.nan_check_level != "off":
             check_finite(z, "jac_x_z/z")
 
-        def decoder_flat(z_in):
-            # z_in shape [B*T, L]; returns [B*T, F]
+        def decoder_bt(z_in: torch.Tensor) -> torch.Tensor:
+            # z_in: [B, T, L] -> x_hat: [B, T, F]
             return self.decoder(z_in)
 
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
+        # Shape: [B, T, F, B, T, L]
         jac = torch.autograd.functional.jacobian(
-            decoder_flat,
-            z_flat,
+            decoder_bt,
+            z,
             vectorize=True,
             create_graph=False,
-        )  # shape [B*T, F, B*T, L]
+        )
 
         if self.nan_check and self.nan_check_level == "full":
             check_finite(jac, "jac_x_z/raw")
 
-        jac_diag = jac.diagonal(dim1=0, dim2=2)  # [B*T, F, L]
-        jac_btfl = jac_diag.reshape(B, T, self.system_features, L)
+        # Per-(b,t) block diagonal: ∂x[b,t,:] / ∂z[b,t,:]
+        # After two diagonals, permute to [B, T, F, L]
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=3)
+        jac_btfl = jac_diag.permute(2, 3, 0, 1).contiguous()
 
         if self.nan_check and self.nan_check_level != "off":
             check_finite(jac_btfl, "jac_x_z/out")
