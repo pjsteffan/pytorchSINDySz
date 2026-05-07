@@ -682,8 +682,8 @@ class SINDyLoss(nn.Module):
     def __init__(self, *, nan_check: bool = False):
         super(SINDyLoss, self).__init__()
         self.lambda1 = 1
-        self.lambda2 = 1
-        self.lambda3 = 1
+        self.lambda2 = 0
+        self.lambda3 = 0
         self.lambda4 = 0.1
         self.nan_check = bool(nan_check)
 
