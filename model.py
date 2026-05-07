@@ -161,7 +161,7 @@ class FANLayer(nn.Module):
     def forward(self, src):
         g = self.activation(self.input_linear_g(src))
         p = self.input_linear_p(src)
-        return torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
+        return torch.cat((torch.cos(p)-1, torch.sin(p)-1, g), dim=-1)
 
 
 
@@ -288,7 +288,7 @@ class ShallowFANGRUAutoencoder(nn.Module):
         input_dim,
         output_dim=None,
         p_ratio=0.45,
-        use_p_bias=True,
+        use_p_bias=False,
         *,
         encoder_gru_hidden_dim: int | None = None,
         decoder_gru_hidden_dim: int | None = None,
@@ -549,12 +549,16 @@ class SINDyModel(nn.Module):
 
         # Full Jacobian over batch+time to support sequence models (e.g. GRU).
         # Shape: [B, T, L, B, T, F]
-        jac = torch.autograd.functional.jacobian(
-            encoder_bt,
-            x,
-            vectorize=True,
-            create_graph=False,
-        )
+        # Disable cuDNN RNN here: `vectorize=True` uses vmap, and cuDNN's
+        # `_cudnn_rnn_backward` has no batching rule. The native (non-cuDNN)
+        # GRU backward does, so disabling cuDNN makes the jacobian work.
+        with torch.backends.cudnn.flags(enabled=False):
+            jac = torch.autograd.functional.jacobian(
+                encoder_bt,
+                x,
+                vectorize=True,
+                create_graph=False,
+            )
 
         if self.nan_check and self.nan_check_level == "full":
             check_finite(jac, "jac_z_x/raw")
@@ -563,7 +567,7 @@ class SINDyModel(nn.Module):
         # First diagonal picks matching batch index -> [T, L, T, F, B]
         # Second diagonal picks matching time index  -> [L, F, B, T]
         # Permute to [B, T, L, F]
-        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=3)
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
         jac_btlf = jac_diag.permute(2, 3, 0, 1).contiguous()
 
         if self.nan_check and self.nan_check_level != "off":
@@ -591,19 +595,22 @@ class SINDyModel(nn.Module):
 
         # Full Jacobian over batch+time to support sequence models (e.g. GRU).
         # Shape: [B, T, F, B, T, L]
-        jac = torch.autograd.functional.jacobian(
-            decoder_bt,
-            z,
-            vectorize=True,
-            create_graph=False,
-        )
+        # See note in `compute_jacobian_z_wrt_x`: cuDNN RNN backward has no
+        # vmap batching rule, so disable cuDNN for the jacobian call.
+        with torch.backends.cudnn.flags(enabled=False):
+            jac = torch.autograd.functional.jacobian(
+                decoder_bt,
+                z,
+                vectorize=True,
+                create_graph=False,
+            )
 
         if self.nan_check and self.nan_check_level == "full":
             check_finite(jac, "jac_x_z/raw")
 
         # Per-(b,t) block diagonal: ∂x[b,t,:] / ∂z[b,t,:]
         # After two diagonals, permute to [B, T, F, L]
-        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=3)
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
         jac_btfl = jac_diag.permute(2, 3, 0, 1).contiguous()
 
         if self.nan_check and self.nan_check_level != "off":
@@ -674,10 +681,10 @@ class SINDyModel(nn.Module):
 class SINDyLoss(nn.Module):
     def __init__(self, *, nan_check: bool = False):
         super(SINDyLoss, self).__init__()
-        self.lambda1 = 0.1
-        self.lambda2 = 0.1
-        self.lambda3 = 0.1
-        self.lambda4 = 0.01
+        self.lambda1 = 1
+        self.lambda2 = 1
+        self.lambda3 = 1
+        self.lambda4 = 0.1
         self.nan_check = bool(nan_check)
 
     def apply_finite_difference_batch(
