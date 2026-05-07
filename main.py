@@ -1,8 +1,7 @@
 from datasets import WRsmallepoch
 from model import (
     SINDySz,
-    CapacityMatchedShallowMLPAutoencoder,
-    ShallowFANAutoencoder,
+    ShallowFANGRUAutoencoder,
 )
 
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -53,17 +52,17 @@ def main(data_file, annotation_file, sample_rate=5000):
     poly_order = 2
     batch_size = 2
 
-    # Two experimental conditions for encoder/decoder:
-    # 1) CapacityMatchedShallowMLPEncoder/Decoder
-    # 2) ShallowFANEncoder/Decoder
+    # GRU-based encoder/decoder condition.
     #
-    # Note: both autoencoders are defined over the *feature* dimension; since this
-    # script uses `system_features=2`, the bottleneck becomes 0 (2//10).
-    # If you intended to encode over a larger feature vector (e.g. channels),
-    # update `system_features` accordingly.
+    # `ShallowFANGRUAutoencoder` replaces the MLP bottleneck/expander layers
+    # with GRUs operating along the time dimension, while keeping the FAN
+    # layers and Win/Wout projections over the feature dimension.
+    #
+    # Note: the autoencoder is defined over the *feature* dimension; the
+    # bottleneck is `system_features // 10`, so `system_features` must be
+    # large enough (>=10) to give a non-zero bottleneck.
     conditions = [
-        ("capacity_matched_shallow_mlp", CapacityMatchedShallowMLPAutoencoder),
-        ("shallow_fan", ShallowFANAutoencoder),
+        ("shallow_fan_gru", ShallowFANGRUAutoencoder),
     ]
 
     for name, AE in conditions:
