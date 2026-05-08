@@ -369,14 +369,91 @@ def pytorch_hilbert(signal, axis=1):
     return analytic_signal
 
 
-def extract_real_component(x):
-    # Expect x shape [B, T, *]; Hilbert along time (axis=1)
-    return torch.abs(pytorch_hilbert(x, axis=1))
+def _debug_nan_guard(out: torch.Tensor, name: str, **context: torch.Tensor) -> None:
+    """Inspect ``out`` for non-finite values and raise with diagnostics.
+
+    Set a breakpoint on the ``raise`` line below to inspect ``out`` and any
+    intermediate tensors passed via ``context`` (e.g. ``re``, ``im``, ``mag``)
+    in the debugger right before the function would return non-finite values.
+    """
+
+    if not torch.isfinite(out).all():
+        n_nan = int(torch.isnan(out).sum().item())
+        n_posinf = int(torch.isposinf(out).sum().item())
+        n_neginf = int(torch.isneginf(out).sum().item())
+        ctx_summary = []
+        for cname, ct in context.items():
+            if not isinstance(ct, torch.Tensor):
+                continue
+            if ct.is_complex():
+                fin = torch.isfinite(ct.real) & torch.isfinite(ct.imag)
+            else:
+                fin = torch.isfinite(ct)
+            ctx_summary.append(
+                f"{cname}: shape={tuple(ct.shape)} dtype={ct.dtype} "
+                f"finite={int(fin.sum().item())}/{ct.numel()}"
+            )
+        ctx_str = " | ".join(ctx_summary) if ctx_summary else "(no context)"
+        # <-- BREAKPOINT HERE: inspect `out` and **context tensors above.
+        raise FloatingPointError(
+            f"non-finite about to be returned from {name}: "
+            f"shape={tuple(out.shape)} dtype={out.dtype} device={out.device} "
+            f"nan={n_nan} +inf={n_posinf} -inf={n_neginf} :: {ctx_str}"
+        )
 
 
-def extract_imaginary_component(x):
+def extract_real_component(x, eps: float = 1e-6):
     # Expect x shape [B, T, *]; Hilbert along time (axis=1)
-    return torch.angle(pytorch_hilbert(x, axis=1))
+    # Clamp magnitude away from zero so the 1/|a| factor in the gradient of
+    # sqrt(re^2 + im^2) cannot blow up. Forward output is unchanged whenever
+    # |a| >= eps; below eps the magnitude is floored to eps (a small bias
+    # confined to near-zero samples where the analytic magnitude is
+    # ill-defined anyway).
+    a = pytorch_hilbert(x, axis=1)
+    re = a.real
+    im = a.imag
+    mag = torch.sqrt(re * re + im * im)
+    safe_mag = torch.clamp(mag, min=eps)
+    _debug_nan_guard(
+        safe_mag,
+        "extract_real_component",
+        x=x,
+        a=a,
+        re=re,
+        im=im,
+        mag=mag,
+    )
+    return safe_mag
+
+
+def extract_imaginary_component(x, eps: float = 1e-6):
+    # Expect x shape [B, T, *]; Hilbert along time (axis=1)
+    # angle(a) = atan2(im, re) has gradient ~ 1/|a|^2 which explodes near the
+    # origin. Since atan2 is scale-invariant (atan2(c*im, c*re) == atan2(im, re)
+    # for c > 0), rescaling (re, im) by 1 / sqrt(|a|^2 + eps^2) leaves the
+    # forward output unchanged for |a| >> eps while bounding the backward path
+    # by ~1/eps^2 near the origin.
+    a = pytorch_hilbert(x, axis=1)
+    re = a.real
+    im = a.imag
+    denom = torch.sqrt(re * re + im * im + eps * eps)
+    scale = 1.0 / denom
+    re_s = re * scale
+    im_s = im * scale
+    out = torch.atan2(im_s, re_s)
+    _debug_nan_guard(
+        out,
+        "extract_imaginary_component",
+        x=x,
+        a=a,
+        re=re,
+        im=im,
+        denom=denom,
+        scale=scale,
+        re_s=re_s,
+        im_s=im_s,
+    )
+    return out
 
 
 def reshape_time_to_feature_blocks(
@@ -684,7 +761,7 @@ class SINDyLoss(nn.Module):
         self.lambda1 = 1
         self.lambda2 = 0
         self.lambda3 = 0
-        self.lambda4 = 0.1
+        self.lambda4 = 0
         self.nan_check = bool(nan_check)
 
     def apply_finite_difference_batch(
@@ -959,6 +1036,13 @@ class SINDySz(L.LightningModule):
         self.log("test_loss", loss)
         return loss
 
+    
+
+
+    def on_after_backward(self):
+        print('After Backward pass')
+    
+    
     def on_train_batch_end(self, outputs, batch, batch_idx):
 
         # Prune small SINDy weights after optimizer step so zeros persist into next iteration
