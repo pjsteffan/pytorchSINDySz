@@ -402,58 +402,15 @@ def _debug_nan_guard(out: torch.Tensor, name: str, **context: torch.Tensor) -> N
         )
 
 
-def extract_real_component(x, eps: float = 1e-6):
-    # Expect x shape [B, T, *]; Hilbert along time (axis=1)
-    # Clamp magnitude away from zero so the 1/|a| factor in the gradient of
-    # sqrt(re^2 + im^2) cannot blow up. Forward output is unchanged whenever
-    # |a| >= eps; below eps the magnitude is floored to eps (a small bias
-    # confined to near-zero samples where the analytic magnitude is
-    # ill-defined anyway).
-    a = pytorch_hilbert(x, axis=1)
-    re = a.real
-    im = a.imag
-    mag = torch.sqrt(re * re + im * im)
-    safe_mag = torch.clamp(mag, min=eps)
-    _debug_nan_guard(
-        safe_mag,
-        "extract_real_component",
-        x=x,
-        a=a,
-        re=re,
-        im=im,
-        mag=mag,
-    )
-    return safe_mag
 
-
-def extract_imaginary_component(x, eps: float = 1e-6):
-    # Expect x shape [B, T, *]; Hilbert along time (axis=1)
-    # angle(a) = atan2(im, re) has gradient ~ 1/|a|^2 which explodes near the
-    # origin. Since atan2 is scale-invariant (atan2(c*im, c*re) == atan2(im, re)
-    # for c > 0), rescaling (re, im) by 1 / sqrt(|a|^2 + eps^2) leaves the
-    # forward output unchanged for |a| >> eps while bounding the backward path
-    # by ~1/eps^2 near the origin.
+def hilbert_features(x, eps: float = 1e-6):
+    """Return (mag, cos_phase, sin_phase) along time axis 1."""
     a = pytorch_hilbert(x, axis=1)
-    re = a.real
-    im = a.imag
-    denom = torch.sqrt(re * re + im * im + eps * eps)
-    scale = 1.0 / denom
-    re_s = re * scale
-    im_s = im * scale
-    out = torch.atan2(im_s, re_s)
-    _debug_nan_guard(
-        out,
-        "extract_imaginary_component",
-        x=x,
-        a=a,
-        re=re,
-        im=im,
-        denom=denom,
-        scale=scale,
-        re_s=re_s,
-        im_s=im_s,
-    )
-    return out
+    re, im = a.real, a.imag
+    mag = torch.sqrt(re*re + im*im + eps*eps)   # eps inside sqrt → grad-safe
+    cos_p = re / mag
+    sin_p = im / mag
+    return (mag, cos_p, sin_p)
 
 
 def reshape_time_to_feature_blocks(
@@ -547,7 +504,7 @@ class SINDyModel(nn.Module):
 
     def compute_library_dim(self):
         self_features = self.latent_features
-        hilbert_features = 2 * self.latent_features
+        hilbert_features = 3 * self.latent_features
 
         poly_features = 0
         for n in range(1, self.poly_order + 1):
@@ -591,8 +548,13 @@ class SINDyModel(nn.Module):
             check_finite(z, "compute_library/linear_z")
 
         # Hilbert-derived features (real/imag parts) along time axis
-        library.append(extract_real_component(z))
-        library.append(extract_imaginary_component(z))
+        mag, cos_p, sin_p = hilbert_features(z)
+        library.append(mag)
+        library.append(cos_p)
+        library.append(sin_p)
+        
+        
+        #Add append
 
         if self.nan_check and self.nan_check_level != "off":
             check_finite(library[-2], "compute_library/hilbert_real")
@@ -759,9 +721,9 @@ class SINDyLoss(nn.Module):
     def __init__(self, *, nan_check: bool = False):
         super(SINDyLoss, self).__init__()
         self.lambda1 = 1
-        self.lambda2 = 0
-        self.lambda3 = 0
-        self.lambda4 = 0
+        self.lambda2 = 1
+        self.lambda3 = 1
+        self.lambda4 = 1
         self.nan_check = bool(nan_check)
 
     def apply_finite_difference_batch(
@@ -1036,11 +998,92 @@ class SINDySz(L.LightningModule):
         self.log("test_loss", loss)
         return loss
 
-    
 
 
     def on_after_backward(self):
-        print('After Backward pass')
+        """Report which model sections have non-finite gradients.
+
+        Walks parameters of each top-level section of ``self.model``
+        (encoder, decoder, SINDy_predict, plus any other direct submodules)
+        and prints, per section:
+            - which parameters have non-finite gradients (NaN / +Inf / -Inf counts)
+            - which parameters have ``grad is None`` (not part of the graph)
+            - a section-level summary
+        """
+
+        # Build the list of (section_name, module) to inspect. Cover the named
+        # pieces of SINDyModel explicitly, plus catch anything else hanging off
+        # self.model so nothing is silently ignored.
+        sections: list[tuple[str, nn.Module]] = []
+        seen_ids: set[int] = set()
+        for sect_name in ("encoder", "decoder", "SINDy_predict"):
+            sub = getattr(self.model, sect_name, None)
+            if isinstance(sub, nn.Module):
+                sections.append((sect_name, sub))
+                seen_ids.add(id(sub))
+
+        for child_name, child in self.model.named_children():
+            if id(child) in seen_ids:
+                continue
+            sections.append((child_name, child))
+            seen_ids.add(id(child))
+
+        any_bad = False
+        lines: list[str] = []
+        for sect_name, module in sections:
+            sect_bad: list[str] = []
+            sect_none: list[str] = []
+            n_params = 0
+            for pname, p in module.named_parameters(recurse=True):
+                if not p.requires_grad:
+                    continue
+                n_params += 1
+                g = p.grad
+                if g is None:
+                    sect_none.append(pname)
+                    continue
+                if g.is_complex():
+                    finite_mask = torch.isfinite(g.real) & torch.isfinite(g.imag)
+                    nan_mask = torch.isnan(g.real) | torch.isnan(g.imag)
+                    posinf_mask = torch.isposinf(g.real) | torch.isposinf(g.imag)
+                    neginf_mask = torch.isneginf(g.real) | torch.isneginf(g.imag)
+                else:
+                    finite_mask = torch.isfinite(g)
+                    nan_mask = torch.isnan(g)
+                    posinf_mask = torch.isposinf(g)
+                    neginf_mask = torch.isneginf(g)
+                if bool(finite_mask.all().item()):
+                    continue
+                n_nan = int(nan_mask.sum().item())
+                n_pinf = int(posinf_mask.sum().item())
+                n_ninf = int(neginf_mask.sum().item())
+                sect_bad.append(
+                    f"{pname} shape={tuple(g.shape)} "
+                    f"nan={n_nan} +inf={n_pinf} -inf={n_ninf}"
+                )
+
+            status = "OK" if not sect_bad else "NONFINITE"
+            header = (
+                f"[on_after_backward] section={sect_name} status={status} "
+                f"params={n_params} bad={len(sect_bad)} grad_none={len(sect_none)}"
+            )
+            lines.append(header)
+            for entry in sect_bad:
+                lines.append(f"  - {sect_name}/{entry}")
+            if sect_none:
+                lines.append(
+                    f"  (grad is None for: {', '.join(sect_none)})"
+                )
+            if sect_bad:
+                any_bad = True
+
+        if any_bad:
+            lines.insert(0, "[on_after_backward] non-finite gradients detected:")
+        else:
+            lines.insert(0, "[on_after_backward] all gradients finite")
+
+        # Single print to keep output coherent across distributed/async logs.
+        print("\n".join(lines))
     
     
     def on_train_batch_end(self, outputs, batch, batch_idx):
