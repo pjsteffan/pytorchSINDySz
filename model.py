@@ -1085,7 +1085,7 @@ class SINDySz(L.LightningModule):
         # Single print to keep output coherent across distributed/async logs.
         print("\n".join(lines))
     
-    
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
 
         # Prune small SINDy weights after optimizer step so zeros persist into next iteration

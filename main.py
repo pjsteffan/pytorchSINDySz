@@ -76,7 +76,7 @@ def main(data_file, annotation_file, sample_rate=5000):
             poly_order=poly_order,
             encoder=ae.encoder,
             decoder=ae.decoder,
-            lr=0.00001,
+            lr=0.001,
             nan_check=True,
         ).to(torch.get_default_dtype())
 
