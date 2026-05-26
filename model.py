@@ -161,7 +161,7 @@ class FANLayer(nn.Module):
     def forward(self, src):
         g = self.activation(self.input_linear_g(src))
         p = self.input_linear_p(src)
-        return torch.cat((torch.cos(p)-1, torch.sin(p)-1, g), dim=-1)
+        return torch.cat((torch.cos(p), torch.sin(p), g), dim=-1)
 
 
 
@@ -632,7 +632,7 @@ class SINDyLoss(nn.Module):
         self.lambda1 = 1
         self.lambda2 = 1
         self.lambda3 = 1
-        self.lambda4 = 1
+        self.lambda4 = 0.01
         self.nan_check = bool(nan_check)
 
     def apply_finite_difference_batch(
@@ -654,7 +654,13 @@ class SINDyLoss(nn.Module):
         )
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
-        """Batched SINDy loss.
+        """Batched SINDy loss with variance-normalized MSE terms.
+
+        Each MSE term is divided by the variance of its target, making the
+        loss components dimensionless and naturally O(1) (representing the
+        "fraction of variance unexplained" = ``1 - R²``). The ``lambda*``
+        parameters therefore act as **priority weights** rather than scale
+        corrections. The L1 regularization term is not normalized.
 
         Args:
             x: [B, T, F]
@@ -665,7 +671,10 @@ class SINDyLoss(nn.Module):
             jac_x_z: [B, T, F, L]
             SINDy_weights: [L, library_dim]
         Returns:
-            scalar loss
+            Tuple ``(total_loss, recon_loss, sindy_loss_xdot,
+            sindy_loss_zdot, sindy_regularization, diagnostics)`` where
+            ``diagnostics`` is a dict of Python scalars containing target
+            variances, unnormalized MSE values, and per-term R² values.
         """
 
         if self.nan_check:
@@ -702,9 +711,26 @@ class SINDyLoss(nn.Module):
         if self.nan_check:
             check_finite(z_dot_pred, "loss/z_dot_pred")
 
-        recon_loss = self.lambda1 * F.mse_loss(x, x_hat)
-        sindy_loss_xdot = self.lambda2 * F.mse_loss(x_dot, x_dot_pred)
-        sindy_loss_zdot = self.lambda3 * F.mse_loss(z_dot_pred, y_hat_trim)
+        # Compute target variances for normalization (detached = not part of
+        # optimization; clamped to avoid division by zero).
+        x_var = x.detach().var().clamp_min(1e-12)
+        x_dot_var = x_dot.detach().var().clamp_min(1e-12)
+        y_hat_var = y_hat_trim.detach().var().clamp_min(1e-12)
+
+        if self.nan_check:
+            check_finite(x_var, "loss/x_var")
+            check_finite(x_dot_var, "loss/x_dot_var")
+            check_finite(y_hat_var, "loss/y_hat_var")
+
+        # Unnormalized MSE values (kept for diagnostics/logging).
+        recon_mse_unnorm = F.mse_loss(x, x_hat)
+        xdot_mse_unnorm = F.mse_loss(x_dot, x_dot_pred)
+        zdot_mse_unnorm = F.mse_loss(z_dot_pred, y_hat_trim)
+
+        # Normalized MSE losses (dimensionless, fraction of variance unexplained).
+        recon_loss = self.lambda1 * recon_mse_unnorm / x_var
+        sindy_loss_xdot = self.lambda2 * xdot_mse_unnorm / x_dot_var
+        sindy_loss_zdot = self.lambda3 * zdot_mse_unnorm / y_hat_var
         sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
 
         if self.nan_check:
@@ -720,36 +746,66 @@ class SINDyLoss(nn.Module):
         if self.nan_check:
             check_finite(total_loss, "loss/total_loss")
 
+        diagnostics = {
+            "x_var": x_var.item(),
+            "x_dot_var": x_dot_var.item(),
+            "y_hat_var": y_hat_var.item(),
+            "recon_mse_unnorm": recon_mse_unnorm.item(),
+            "xdot_mse_unnorm": xdot_mse_unnorm.item(),
+            "zdot_mse_unnorm": zdot_mse_unnorm.item(),
+            "R2_recon": (
+                1.0 - (recon_loss.item() / self.lambda1)
+                if self.lambda1 > 0
+                else 0.0
+            ),
+            "R2_xdot": (
+                1.0 - (sindy_loss_xdot.item() / self.lambda2)
+                if self.lambda2 > 0
+                else 0.0
+            ),
+            "R2_zdot": (
+                1.0 - (sindy_loss_zdot.item() / self.lambda3)
+                if self.lambda3 > 0
+                else 0.0
+            ),
+        }
+
         return (
             total_loss,
             recon_loss,
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
+            diagnostics,
         )
 
 
 class SINDyPathLoss(nn.Module):
     """Loss for the SINDy optimization path (encoder + sindy_model).
 
-    Computes the three SINDy-related loss components:
+    Computes the three SINDy-related loss components with variance-normalized
+    MSE terms (dimensionless, naturally O(1)):
       - ``sindy_loss_xdot`` (λ2): MSE between ``x_dot`` (finite-difference)
         and ``x_dot_pred`` produced by mapping ``y_hat`` through the decoder
-        Jacobian.
+        Jacobian, divided by ``var(x_dot)``.
       - ``sindy_loss_zdot`` (λ3): MSE between ``z_dot_pred`` (encoder Jacobian
-        times ``x_dot``) and ``y_hat``.
-      - ``sindy_regularization`` (λ4): L1 penalty on the SINDy weight matrix.
+        times ``x_dot``) and ``y_hat``, divided by ``var(y_hat)``.
+      - ``sindy_regularization`` (λ4): L1 penalty on the SINDy weight matrix
+        (not normalized).
+
+    With normalization, the ``lambda*`` parameters act as **priority weights**
+    rather than scale corrections.
     """
 
     def __init__(self, *, nan_check: bool = False):
         super(SINDyPathLoss, self).__init__()
         self.lambda2 = 1
         self.lambda3 = 1
-        self.lambda4 = 1
+        self.lambda4 = 0.01
         self.nan_check = bool(nan_check)
 
     def forward(self, x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights):
-        """Batched SINDy-path loss.
+        """Batched SINDy-path loss with variance-normalized MSE terms.
 
         Args:
             x: [B, T, F]
@@ -760,7 +816,10 @@ class SINDyPathLoss(nn.Module):
             SINDy_weights: [L, library_dim]
 
         Returns:
-            (sindy_path_loss, sindy_loss_xdot, sindy_loss_zdot, sindy_regularization)
+            Tuple ``(sindy_path_loss, sindy_loss_xdot, sindy_loss_zdot,
+            sindy_regularization, diagnostics)`` where ``diagnostics`` is a
+            dict of Python scalars containing target variances, unnormalized
+            MSE values, and per-term R² values.
         """
 
         if self.nan_check:
@@ -792,8 +851,21 @@ class SINDyPathLoss(nn.Module):
         if self.nan_check:
             check_finite(z_dot_pred, "sindy_path_loss/z_dot_pred")
 
-        sindy_loss_xdot = self.lambda2 * F.mse_loss(x_dot, x_dot_pred)
-        sindy_loss_zdot = self.lambda3 * F.mse_loss(z_dot_pred, y_hat_trim)
+        # Compute target variances for normalization (detached).
+        x_dot_var = x_dot.detach().var().clamp_min(1e-12)
+        y_hat_var = y_hat_trim.detach().var().clamp_min(1e-12)
+
+        if self.nan_check:
+            check_finite(x_dot_var, "sindy_path_loss/x_dot_var")
+            check_finite(y_hat_var, "sindy_path_loss/y_hat_var")
+
+        # Unnormalized MSE values for diagnostics.
+        xdot_mse_unnorm = F.mse_loss(x_dot, x_dot_pred)
+        zdot_mse_unnorm = F.mse_loss(z_dot_pred, y_hat_trim)
+
+        # Normalized MSE losses (dimensionless, fraction of variance unexplained).
+        sindy_loss_xdot = self.lambda2 * xdot_mse_unnorm / x_dot_var
+        sindy_loss_zdot = self.lambda3 * zdot_mse_unnorm / y_hat_var
         sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
 
         if self.nan_check:
@@ -806,19 +878,40 @@ class SINDyPathLoss(nn.Module):
         if self.nan_check:
             check_finite(sindy_path_loss, "sindy_path_loss/total")
 
+        diagnostics = {
+            "x_dot_var": x_dot_var.item(),
+            "y_hat_var": y_hat_var.item(),
+            "xdot_mse_unnorm": xdot_mse_unnorm.item(),
+            "zdot_mse_unnorm": zdot_mse_unnorm.item(),
+            "R2_xdot": (
+                1.0 - (sindy_loss_xdot.item() / self.lambda2)
+                if self.lambda2 > 0
+                else 0.0
+            ),
+            "R2_zdot": (
+                1.0 - (sindy_loss_zdot.item() / self.lambda3)
+                if self.lambda3 > 0
+                else 0.0
+            ),
+        }
+
         return (
             sindy_path_loss,
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
+            diagnostics,
         )
 
 
 class DecoderPathLoss(nn.Module):
     """Loss for the Decoder optimization path (encoder + decoder).
 
-    Computes the reconstruction loss component ``recon_loss`` (λ1) which is
-    MSE between ``x`` and ``x_hat``.
+    Computes the variance-normalized reconstruction loss ``recon_loss`` (λ1):
+    MSE between ``x`` and ``x_hat`` divided by ``var(x)``. The result is
+    dimensionless and naturally O(1) (fraction of variance unexplained).
+    With normalization ``lambda1`` acts as a priority weight rather than a
+    scale correction.
     """
 
     def __init__(self, *, nan_check: bool = False):
@@ -827,26 +920,49 @@ class DecoderPathLoss(nn.Module):
         self.nan_check = bool(nan_check)
 
     def forward(self, x, x_hat):
-        """Batched decoder-path loss.
+        """Batched decoder-path loss with variance-normalized MSE.
 
         Args:
             x: [B, T, F]
             x_hat: [B, T, F]
 
         Returns:
-            (decoder_path_loss, recon_loss) -- both equal, returned for symmetry
-            with ``SINDyPathLoss``.
+            Tuple ``(decoder_path_loss, recon_loss, diagnostics)``.
+            ``decoder_path_loss`` and ``recon_loss`` are equal (returned for
+            symmetry with ``SINDyPathLoss``); ``diagnostics`` is a dict of
+            Python scalars containing ``x_var``, ``recon_mse_unnorm``, and
+            ``R2_recon``.
         """
         if self.nan_check:
             check_finite(x, "decoder_path_loss/x")
             check_finite(x_hat, "decoder_path_loss/x_hat")
 
-        recon_loss = self.lambda1 * F.mse_loss(x, x_hat)
+        # Compute target variance for normalization (detached).
+        x_var = x.detach().var().clamp_min(1e-12)
+
+        if self.nan_check:
+            check_finite(x_var, "decoder_path_loss/x_var")
+
+        # Unnormalized MSE for diagnostics.
+        recon_mse_unnorm = F.mse_loss(x, x_hat)
+
+        # Normalized MSE loss (dimensionless, fraction of variance unexplained).
+        recon_loss = self.lambda1 * recon_mse_unnorm / x_var
 
         if self.nan_check:
             check_finite(recon_loss, "decoder_path_loss/recon_loss")
 
-        return recon_loss, recon_loss
+        diagnostics = {
+            "x_var": x_var.item(),
+            "recon_mse_unnorm": recon_mse_unnorm.item(),
+            "R2_recon": (
+                1.0 - (recon_loss.item() / self.lambda1)
+                if self.lambda1 > 0
+                else 0.0
+            ),
+        }
+
+        return recon_loss, recon_loss, diagnostics
 
 
 #
@@ -1230,12 +1346,14 @@ class SINDySz(L.LightningModule):
                 sindy_loss_xdot,
                 sindy_loss_zdot,
                 sindy_regularization,
+                diagnostics,
             ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
             self.log("train_total_loss", loss)
             self.log("train_recon_loss", recon_loss)
             self.log("train_sindyxdot_loss", sindy_loss_xdot)
             self.log("train_sindyzdot_loss", sindy_loss_zdot)
             self.log("train_sindyreg_loss", sindy_regularization)
+            self._log_loss_diagnostics(diagnostics, prefix="train_")
             return loss
 
         # Dual-optimizer (manual optimization) path.
@@ -1249,6 +1367,7 @@ class SINDySz(L.LightningModule):
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
+            sindy_diagnostics,
         ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.manual_backward(sindy_loss)
         opt_sindy.step()
@@ -1260,7 +1379,9 @@ class SINDySz(L.LightningModule):
         # built from the (now-updated) encoder weights.
         self.toggle_optimizer(opt_decoder)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+        decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
+            x, x_hat
+        )
         self.manual_backward(decoder_loss)
         opt_decoder.step()
         opt_decoder.zero_grad()
@@ -1276,6 +1397,8 @@ class SINDySz(L.LightningModule):
         self.log("train_sindyxdot_loss", sindy_loss_xdot.detach())
         self.log("train_sindyzdot_loss", sindy_loss_zdot.detach())
         self.log("train_sindyreg_loss", sindy_regularization.detach())
+        self._log_loss_diagnostics(sindy_diagnostics, prefix="train_")
+        self._log_loss_diagnostics(decoder_diagnostics, prefix="train_")
 
         return total_loss
 
@@ -1291,8 +1414,11 @@ class SINDySz(L.LightningModule):
                 sindy_loss_xdot,
                 sindy_loss_zdot,
                 sindy_regularization,
+                sindy_diagnostics,
             ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
-            decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+            decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
+                x, x_hat
+            )
             total_loss = sindy_loss + decoder_loss
 
             self.log("valid_loss", total_loss)
@@ -1302,6 +1428,8 @@ class SINDySz(L.LightningModule):
             self.log("valid_sindyxdot_loss", sindy_loss_xdot)
             self.log("valid_sindyzdot_loss", sindy_loss_zdot)
             self.log("valid_sindyreg_loss", sindy_regularization)
+            self._log_loss_diagnostics(sindy_diagnostics, prefix="valid_")
+            self._log_loss_diagnostics(decoder_diagnostics, prefix="valid_")
             return total_loss
 
         (
@@ -1310,12 +1438,14 @@ class SINDySz(L.LightningModule):
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
+            diagnostics,
         ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("valid_loss", total_loss)
         self.log("valid_recon_loss", recon_loss)
         self.log("valid_sindyxdot_loss", sindy_loss_xdot)
         self.log("valid_sindyzdot_loss", sindy_loss_zdot)
         self.log("valid_sindyreg_loss", sindy_regularization)
+        self._log_loss_diagnostics(diagnostics, prefix="valid_")
         return total_loss
 
     def test_step(self, batch, batch_idx):
@@ -1330,8 +1460,11 @@ class SINDySz(L.LightningModule):
                 sindy_loss_xdot,
                 sindy_loss_zdot,
                 sindy_regularization,
+                sindy_diagnostics,
             ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
-            decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+            decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
+                x, x_hat
+            )
             total_loss = sindy_loss + decoder_loss
 
             self.log("test_loss", total_loss)
@@ -1341,6 +1474,8 @@ class SINDySz(L.LightningModule):
             self.log("test_sindyxdot_loss", sindy_loss_xdot)
             self.log("test_sindyzdot_loss", sindy_loss_zdot)
             self.log("test_sindyreg_loss", sindy_regularization)
+            self._log_loss_diagnostics(sindy_diagnostics, prefix="test_")
+            self._log_loss_diagnostics(decoder_diagnostics, prefix="test_")
             return total_loss
 
         (
@@ -1349,15 +1484,29 @@ class SINDySz(L.LightningModule):
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
+            diagnostics,
         ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("test_loss", total_loss)
         self.log("test_recon_loss", recon_loss)
         self.log("test_sindyxdot_loss", sindy_loss_xdot)
         self.log("test_sindyzdot_loss", sindy_loss_zdot)
         self.log("test_sindyreg_loss", sindy_regularization)
+        self._log_loss_diagnostics(diagnostics, prefix="test_")
         return total_loss
 
+    def _log_loss_diagnostics(self, diagnostics: dict, *, prefix: str) -> None:
+        """Log entries of a loss-diagnostics dict under ``<prefix><key>``.
 
+        ``diagnostics`` is a dict of Python scalars (target variances,
+        unnormalized MSE values and per-term R² values) produced by the loss
+        modules. Keys vary per loss class -- this helper logs whatever keys
+        are present so it works uniformly for ``SINDyLoss``,
+        ``SINDyPathLoss`` and ``DecoderPathLoss`` diagnostics.
+        """
+        if not diagnostics:
+            return
+        for key, value in diagnostics.items():
+            self.log(f"{prefix}{key}", value)
 
     def on_after_backward(self):
         """Report which model sections have non-finite gradients.
