@@ -1,14 +1,27 @@
 from datasets import WRsmallepoch
 from model import (
     SINDySz,
-    ShallowFANGRUAutoencoder,
+    ShallowFANGRUEncoder,
+    ShallowFANGRUDecoder,
 )
 
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import torch.utils.data as data
 import torch
 import lightning as L
-from lightning.pytorch.callbacks import EarlyStopping,Callback
+from lightning.pytorch.callbacks import EarlyStopping, Callback
+
+
+def build_shallow_fan_gru(input_dim: int):
+    """Construct an encoder/decoder pair from the shallow FAN-GRU family.
+
+    Replaces the old ``ShallowFANGRUAutoencoder`` wrapper: builds the two
+    modules directly and enforces the implicit ``input_dim == output_dim``
+    coupling that the wrapper used to enforce.
+    """
+    encoder = ShallowFANGRUEncoder(input_dim=input_dim)
+    decoder = ShallowFANGRUDecoder(output_dim=input_dim)
+    return encoder, decoder
 
 
 
@@ -56,26 +69,32 @@ def main(data_file, annotation_file, sample_rate=5000):
 
     # GRU-based encoder/decoder condition.
     #
-    # `ShallowFANGRUAutoencoder` replaces the MLP bottleneck/expander layers
-    # with GRUs operating along the time dimension, while keeping the FAN
-    # layers and Win/Wout projections over the feature dimension.
+    # The shallow FAN-GRU encoder/decoder pair replaces the MLP
+    # bottleneck/expander layers with GRUs operating along the time
+    # dimension, while keeping the FAN layers and Win/Wout projections over
+    # the feature dimension.
     #
-    # Note: the autoencoder is defined over the *feature* dimension; the
-    # bottleneck is `system_features // 10`, so `system_features` must be
-    # large enough (>=10) to give a non-zero bottleneck.
+    # Note: the encoder/decoder are defined over the *feature* dimension;
+    # the bottleneck is `system_features // 10`, so `system_features` must
+    # be large enough (>=10) to give a non-zero bottleneck.
+    #
+    # Each condition is (name, factory) where ``factory(input_dim)`` returns
+    # an ``(encoder, decoder)`` tuple. This replaces the old
+    # ``ShallowFANGRUAutoencoder`` wrapper class that previously sat between
+    # this script and the encoder/decoder modules.
     conditions = [
-        ("shallow_fan_gru", ShallowFANGRUAutoencoder),
+        ("shallow_fan_gru", build_shallow_fan_gru),
     ]
 
-    for name, AE in conditions:
-        ae = AE(system_features)
+    for name, build_ae in conditions:
+        encoder, decoder = build_ae(system_features)
         sindy_sz = SINDySz(
             time_dim=time_dim,
             system_features=system_features,
             latent_features=latent_features,
             poly_order=poly_order,
-            encoder=ae.encoder,
-            decoder=ae.decoder,
+            encoder=encoder,
+            decoder=decoder,
             lr=0.001,
             nan_check=True,
         ).to(torch.get_default_dtype())
