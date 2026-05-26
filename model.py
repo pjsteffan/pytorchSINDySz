@@ -459,16 +459,21 @@ class SINDyModel(nn.Module):
         system_features,
         latent_features,
         poly_order,
-        encoder: nn.Module | None = None,
-        decoder: nn.Module | None = None,
         sindy_predict: nn.Module | None = None,
         nan_check: bool = False,
         nan_check_level: str = "basic",
     ):
         super(SINDyModel, self).__init__()
-        """SINDy model operating on batched sequences.
+        """SINDy model operating on batched latent sequences.
 
-        Expected input shape: [batch, time_dim, system_features].
+        Expected input shape: [batch, time_dim, latent_features].
+
+        This module is purely responsible for computing the sparse system
+        output from latent encodings. Encoder/decoder orchestration and
+        Jacobian computations live in the Lightning module `SINDySz`.
+
+        `system_features` and `time_dim` are retained for metadata and
+        documentation purposes; they are not used in the forward pass.
         """
         self.time_dim = time_dim
         self.system_features = system_features
@@ -484,18 +489,6 @@ class SINDyModel(nn.Module):
                 f"got {nan_check_level!r}"
             )
 
-        # Allow caller to inject custom encoder/decoder/predictor modules.
-        # Defaults preserve existing behavior.
-        self.encoder = (
-            encoder
-            if encoder is not None
-            else nn.Linear(system_features, latent_features)  # Example encoder
-        )
-        self.decoder = (
-            decoder
-            if decoder is not None
-            else nn.Linear(latent_features, system_features)
-        )
         self.SINDy_predict = (
             sindy_predict
             if sindy_predict is not None
@@ -569,149 +562,55 @@ class SINDyModel(nn.Module):
             check_finite(theta, "compute_library/theta")
         return theta
 
-    def compute_jacobian_z_wrt_x(self, x):
-        """Compute per-example Jacobian ∂z/∂x for batched inputs.
-
-        Args:
-            x (Tensor): shape [B, T, F] with requires_grad=True
-        Returns:
-            Tensor: Jacobian of shape [B, T, latent_features, F]
-        """
-        B, T, feat_dim = x.shape
-
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(x, "jac_z_x/x")
-
-        def encoder_bt(x_in: torch.Tensor) -> torch.Tensor:
-            # x_in: [B, T, F] -> z: [B, T, L]
-            return self.encoder(x_in)
-
-        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
-        # Shape: [B, T, L, B, T, F]
-        # Disable cuDNN RNN here: `vectorize=True` uses vmap, and cuDNN's
-        # `_cudnn_rnn_backward` has no batching rule. The native (non-cuDNN)
-        # GRU backward does, so disabling cuDNN makes the jacobian work.
-        with torch.backends.cudnn.flags(enabled=False):
-            jac = torch.autograd.functional.jacobian(
-                encoder_bt,
-                x,
-                vectorize=True,
-                create_graph=False,
-            )
-
-        if self.nan_check and self.nan_check_level == "full":
-            check_finite(jac, "jac_z_x/raw")
-
-        # Select the per-(b,t) block diagonal: ∂z[b,t,:] / ∂x[b,t,:]
-        # First diagonal picks matching batch index -> [T, L, T, F, B]
-        # Second diagonal picks matching time index  -> [L, F, B, T]
-        # Permute to [B, T, L, F]
-        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
-        jac_btlf = jac_diag.permute(2, 3, 0, 1).contiguous()
-
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(jac_btlf, "jac_z_x/out")
-        return jac_btlf
-
-    def compute_jacobian_x_wrt_z(self, z):
-        """Compute per-example Jacobian ∂x/∂z for batched latents.
+    def forward(self, z):
+        """Forward pass over batched latent sequences.
 
         Args:
             z (Tensor): shape [B, T, latent_features]
         Returns:
-            Tensor: Jacobian of shape [B, T, system_features, latent_features]
-        """
-
-        B, T, lat_dim = z.shape
-        L = lat_dim
-
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(z, "jac_x_z/z")
-
-        def decoder_bt(z_in: torch.Tensor) -> torch.Tensor:
-            # z_in: [B, T, L] -> x_hat: [B, T, F]
-            return self.decoder(z_in)
-
-        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
-        # Shape: [B, T, F, B, T, L]
-        # See note in `compute_jacobian_z_wrt_x`: cuDNN RNN backward has no
-        # vmap batching rule, so disable cuDNN for the jacobian call.
-        with torch.backends.cudnn.flags(enabled=False):
-            jac = torch.autograd.functional.jacobian(
-                decoder_bt,
-                z,
-                vectorize=True,
-                create_graph=False,
-            )
-
-        if self.nan_check and self.nan_check_level == "full":
-            check_finite(jac, "jac_x_z/raw")
-
-        # Per-(b,t) block diagonal: ∂x[b,t,:] / ∂z[b,t,:]
-        # After two diagonals, permute to [B, T, F, L]
-        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
-        jac_btfl = jac_diag.permute(2, 3, 0, 1).contiguous()
-
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(jac_btfl, "jac_x_z/out")
-        return jac_btfl
-
-    def forward(self, x):
-        """Forward pass for batched sequences.
-
-        Args:
-            x (Tensor): shape [B, T, system_features]
-        Returns:
-            tuple: (y_hat, x_hat, z, SINDy_weights, decoder_weight)
+            tuple: (y_hat, SINDy_weights)
                 y_hat: predicted latent time-derivatives, [B, T, latent_features]
-                x_hat: reconstruction, [B, T, system_features]
-                z: latent states, [B, T, latent_features]
+                SINDy_weights: coefficient matrix, [latent_features, library_dim]
         """
-        if x.dim() != 3:
+        if z.dim() != 3:
             raise ValueError(
-                f"Expected x shape [B, T, F] or [B, T]; got {tuple(x.shape)}"
+                f"Expected z shape [B, T, latent_features]; got {tuple(z.shape)}"
+            )
+        if z.shape[-1] != self.latent_features:
+            raise ValueError(
+                f"Expected z last dim == latent_features ({self.latent_features}); "
+                f"got {z.shape[-1]}"
             )
 
-        assert x.dim() == 3, "Expected x shape [B, T, F] or [B, T] (auto-unsqueezed)"
-        # assert x.size(1) == self.time_dim, "Time dimension mismatch"
-
+        # Hard fail on dtype mismatch rather than silently casting:
+        # `.to(dtype)` produces a leaf tensor that does not preserve
+        # `requires_grad`, which would silently break the autograd path
+        # the loss relies on (Jacobian/x_dot/z_dot computations).
+        # Callers (e.g. `SINDySz.forward`) are responsible for casting `x`
+        # before encoding; that cast propagates to `z` naturally.
         param_dtype = next(self.parameters()).dtype
-        if x.dtype != param_dtype:
-            x = x.to(param_dtype)
+        if z.dtype != param_dtype:
+            raise TypeError(
+                f"SINDyModel.forward: z dtype {z.dtype} != param dtype "
+                f"{param_dtype}. Cast the input upstream (before encoding) "
+                "rather than relying on an implicit cast here."
+            )
 
         if self.nan_check and self.nan_check_level != "off":
-            check_finite(x, "forward/x")
-            # If x is finite but z becomes non-finite, parameters are a likely culprit.
-            check_module_params_finite(self.encoder, "forward/encoder")
+            check_finite(z, "sindy_model.forward/z")
 
-        x = x.requires_grad_(True)
+        theta_z = self.compute_library(z)  # [B, T, library_dim]
+        if self.nan_check and self.nan_check_level != "off":
+            check_finite(theta_z, "sindy_model.forward/theta_z")
 
-        # Encoder/decoder act on the feature dimension (last dim) and are batch/time agnostic
-        z = self.encoder(x).requires_grad_(True)  # [B, T, latent_features]
+        y_hat = self.SINDy_predict(theta_z)  # [B, T, latent_features]
         if self.nan_check and self.nan_check_level != "off":
-            check_finite(z, "forward/z")
-        theta_x = self.compute_library(z)  # [B, T, library_dim]
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(theta_x, "forward/theta_x")
-        y_hat = self.SINDy_predict(theta_x)  # [B, T, latent_features]
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(y_hat, "forward/y_hat")
-        x_hat = self.decoder(z)  # [B, T, system_features]
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(x_hat, "forward/x_hat")
+            check_finite(y_hat, "sindy_model.forward/y_hat")
+            check_finite(
+                self.SINDy_predict.weight, "sindy_model.forward/SINDy_predict.weight"
+            )
 
-        # Per-example Jacobian ∂z/∂x: [B, T, L, F]
-        jac_z_x = self.compute_jacobian_z_wrt_x(x)
-        # Per-example Jacobian ∂x/∂z: [B, T, F, L]
-        jac_x_z = self.compute_jacobian_x_wrt_z(z)
-
-        if self.nan_check and self.nan_check_level != "off":
-            check_finite(jac_z_x, "forward/jac_z_x")
-            check_finite(jac_x_z, "forward/jac_x_z")
-            check_finite(self.SINDy_predict.weight, "forward/SINDy_predict.weight")
-
-        # Return weights needed for loss computations (constant across batch/time)
-        return y_hat, x_hat, z, jac_z_x, jac_x_z, self.SINDy_predict.weight
+        return y_hat, self.SINDy_predict.weight
 
 
 
@@ -884,10 +783,85 @@ class SINDySz(L.LightningModule):
         lr: float = 0.001,
         nan_check: bool = False,
         nan_check_level: str = "basic",
+        reinit: bool = True,
     ):
+        """Lightning module that orchestrates the encode/SINDy/decode pipeline.
+
+        Args:
+            model: optional pre-built SINDyModel. Legacy instances that carry
+                their own ``encoder``/``decoder`` are accepted and rewritten
+                into the new layout.
+            time_dim, system_features, latent_features, poly_order:
+                required when ``model`` is None.
+            encoder, decoder: required if not extractable from ``model``.
+            sindy_predict: optional override for the SINDy library->latent
+                projection layer.
+            lr: AdamW learning rate.
+            nan_check, nan_check_level: see ``SINDyModel``.
+            reinit: when True (default), apply ``equal_var_init`` to the
+                encoder, decoder, and sindy_model after assembly. Set to
+                False to preserve weights of caller-supplied modules (e.g.
+                a pretrained encoder/decoder).
+        """
         super(SINDySz, self).__init__()
 
-        if model is None:
+        # Resolve encoder/decoder/sindy_model from inputs. Two supported paths:
+        #   1) `model` (a SINDyModel) is provided, optionally with encoder/decoder
+        #      attributes (legacy layout); also takes encoder/decoder kwargs.
+        #   2) `model` is None: build SINDyModel from scalars; encoder/decoder must
+        #      be supplied separately.
+        if model is not None:
+            # Legacy: model may carry its own encoder/decoder.
+            legacy_encoder = getattr(model, "encoder", None)
+            legacy_decoder = getattr(model, "decoder", None)
+            resolved_encoder = encoder if encoder is not None else legacy_encoder
+            resolved_decoder = decoder if decoder is not None else legacy_decoder
+
+            # Rebuild a clean SINDyModel without encoder/decoder if the legacy
+            # model had them attached. Otherwise reuse the provided model directly.
+            if legacy_encoder is not None or legacy_decoder is not None:
+                legacy_predict = getattr(model, "SINDy_predict", None)
+
+                # Build the new SINDyModel; this also computes library_dim
+                # from the scalar params we hand it.
+                sindy_model = SINDyModel(
+                    time_dim=getattr(model, "time_dim", time_dim),
+                    system_features=getattr(model, "system_features", system_features),
+                    latent_features=getattr(model, "latent_features", latent_features),
+                    poly_order=getattr(model, "poly_order", poly_order),
+                    sindy_predict=legacy_predict,
+                    nan_check=getattr(model, "nan_check", nan_check),
+                    nan_check_level=getattr(model, "nan_check_level", nan_check_level),
+                )
+
+                # Defensive: if the legacy SINDy_predict layer has an
+                # `in_features` that disagrees with the freshly computed
+                # library_dim, refuse — silently swapping a randomly
+                # initialized layer in would corrupt training state.
+                if legacy_predict is not None and hasattr(
+                    legacy_predict, "in_features"
+                ):
+                    if int(legacy_predict.in_features) != int(sindy_model.library_dim):
+                        raise ValueError(
+                            "Legacy SINDy_predict.in_features="
+                            f"{legacy_predict.in_features} does not match the "
+                            f"computed library_dim={sindy_model.library_dim}. "
+                            "Refusing to silently discard or rebind weights."
+                        )
+
+                if legacy_predict is None:
+                    import warnings
+
+                    warnings.warn(
+                        "Legacy SINDyModel was passed without a `SINDy_predict` "
+                        "layer; SINDySz built a freshly initialized one. Any "
+                        "prior training state for the SINDy layer is lost.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            else:
+                sindy_model = model
+        else:
             missing = [
                 name
                 for name, val in (
@@ -904,23 +878,136 @@ class SINDySz(L.LightningModule):
                     "time_dim, system_features, latent_features, poly_order. "
                     f"Missing: {', '.join(missing)}"
                 )
-            model = SINDyModel(
+            sindy_model = SINDyModel(
                 time_dim=time_dim,
                 system_features=system_features,
                 latent_features=latent_features,
                 poly_order=poly_order,
-                encoder=encoder,
-                decoder=decoder,
                 sindy_predict=sindy_predict,
                 nan_check=nan_check,
                 nan_check_level=nan_check_level,
             )
+            resolved_encoder = encoder
+            resolved_decoder = decoder
 
-        self.model = model
+        missing_modules = [
+            name
+            for name, val in (
+                ("encoder", resolved_encoder),
+                ("decoder", resolved_decoder),
+            )
+            if val is None
+        ]
+        if missing_modules:
+            raise TypeError(
+                "SINDySz requires both `encoder` and `decoder` modules; "
+                f"missing: {', '.join(missing_modules)}."
+            )
+
+        self.encoder = resolved_encoder
+        self.decoder = resolved_decoder
+        self.sindy_model = sindy_model
         self.criterion = SINDyLoss(nan_check=nan_check)
         self.lr = float(lr)
 
-        equal_var_init(self.model)
+        # Initialize each component separately. NOTE: this re-initializes
+        # caller-supplied encoder/decoder modules. Pass ``reinit=False`` if
+        # you are providing pretrained weights you want to preserve.
+        if reinit:
+            equal_var_init(self.encoder)
+            equal_var_init(self.decoder)
+            equal_var_init(self.sindy_model)
+
+    def compute_jacobian_z_wrt_x(self, x):
+        """Compute per-example Jacobian ∂z/∂x for batched inputs via ``self.encoder``.
+
+        Args:
+            x (Tensor): shape [B, T, F] with requires_grad=True
+        Returns:
+            Tensor: Jacobian of shape [B, T, latent_features, F]
+        """
+        nan_check = bool(getattr(self.sindy_model, "nan_check", False))
+        nan_check_level = str(
+            getattr(self.sindy_model, "nan_check_level", "off")
+        ).lower()
+
+        if nan_check and nan_check_level != "off":
+            check_finite(x, "jac_z_x/x")
+
+        def encoder_bt(x_in: torch.Tensor) -> torch.Tensor:
+            # x_in: [B, T, F] -> z: [B, T, L]
+            return self.encoder(x_in)
+
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
+        # Shape: [B, T, L, B, T, F]
+        # Disable cuDNN RNN here: `vectorize=True` uses vmap, and cuDNN's
+        # `_cudnn_rnn_backward` has no batching rule. The native (non-cuDNN)
+        # GRU backward does, so disabling cuDNN makes the jacobian work.
+        with torch.backends.cudnn.flags(enabled=False):
+            jac = torch.autograd.functional.jacobian(
+                encoder_bt,
+                x,
+                vectorize=True,
+                create_graph=False,
+            )
+
+        if nan_check and nan_check_level == "full":
+            check_finite(jac, "jac_z_x/raw")
+
+        # Select the per-(b,t) block diagonal: ∂z[b,t,:] / ∂x[b,t,:]
+        # First diagonal picks matching batch index -> [T, L, T, F, B]
+        # Second diagonal picks matching time index  -> [L, F, B, T]
+        # Permute to [B, T, L, F]
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
+        jac_btlf = jac_diag.permute(2, 3, 0, 1).contiguous()
+
+        if nan_check and nan_check_level != "off":
+            check_finite(jac_btlf, "jac_z_x/out")
+        return jac_btlf
+
+    def compute_jacobian_x_wrt_z(self, z):
+        """Compute per-example Jacobian ∂x/∂z for batched latents via ``self.decoder``.
+
+        Args:
+            z (Tensor): shape [B, T, latent_features]
+        Returns:
+            Tensor: Jacobian of shape [B, T, system_features, latent_features]
+        """
+        nan_check = bool(getattr(self.sindy_model, "nan_check", False))
+        nan_check_level = str(
+            getattr(self.sindy_model, "nan_check_level", "off")
+        ).lower()
+
+        if nan_check and nan_check_level != "off":
+            check_finite(z, "jac_x_z/z")
+
+        def decoder_bt(z_in: torch.Tensor) -> torch.Tensor:
+            # z_in: [B, T, L] -> x_hat: [B, T, F]
+            return self.decoder(z_in)
+
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
+        # Shape: [B, T, F, B, T, L]
+        # See note in `compute_jacobian_z_wrt_x`: cuDNN RNN backward has no
+        # vmap batching rule, so disable cuDNN for the jacobian call.
+        with torch.backends.cudnn.flags(enabled=False):
+            jac = torch.autograd.functional.jacobian(
+                decoder_bt,
+                z,
+                vectorize=True,
+                create_graph=False,
+            )
+
+        if nan_check and nan_check_level == "full":
+            check_finite(jac, "jac_x_z/raw")
+
+        # Per-(b,t) block diagonal: ∂x[b,t,:] / ∂z[b,t,:]
+        # After two diagonals, permute to [B, T, F, L]
+        jac_diag = jac.diagonal(dim1=0, dim2=3).diagonal(dim1=0, dim2=2)
+        jac_btfl = jac_diag.permute(2, 3, 0, 1).contiguous()
+
+        if nan_check and nan_check_level != "off":
+            check_finite(jac_btfl, "jac_x_z/out")
+        return jac_btfl
 
     def apply_finite_difference(self, filtered_data, fs):
         """Compute first derivative via finite differences (NumPy).
@@ -959,7 +1046,61 @@ class SINDySz(L.LightningModule):
         return deriv
 
     def forward(self, x):
-        return self.model(x)
+        """Orchestrate the full pipeline: encode -> SINDy -> decode (+ Jacobians).
+
+        Args:
+            x (Tensor): shape [B, T, system_features]
+        Returns:
+            tuple: (y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        """
+        if x.dim() != 3:
+            raise ValueError(
+                f"Expected x shape [B, T, F]; got {tuple(x.shape)}"
+            )
+
+        nan_check = bool(getattr(self.sindy_model, "nan_check", False))
+        nan_check_level = str(
+            getattr(self.sindy_model, "nan_check_level", "off")
+        ).lower()
+        nan_active = nan_check and nan_check_level != "off"
+
+        param_dtype = next(self.parameters()).dtype
+        if x.dtype != param_dtype:
+            x = x.to(param_dtype)
+
+        if nan_active:
+            check_finite(x, "forward/x")
+            # If x is finite but z becomes non-finite, parameters are a likely culprit.
+            check_module_params_finite(self.encoder, "forward/encoder")
+
+        x = x.requires_grad_(True)
+
+        # Encode: [B, T, F] -> [B, T, latent_features]
+        z = self.encoder(x).requires_grad_(True)
+        if nan_active:
+            check_finite(z, "forward/z")
+
+        # SINDy prediction: latent derivatives + sparse coefficient matrix
+        y_hat, SINDy_weights = self.sindy_model(z)
+        if nan_active:
+            check_finite(y_hat, "forward/y_hat")
+
+        # Decode: [B, T, latent_features] -> [B, T, F]
+        x_hat = self.decoder(z)
+        if nan_active:
+            check_finite(x_hat, "forward/x_hat")
+
+        # Per-example Jacobian ∂z/∂x: [B, T, L, F]
+        jac_z_x = self.compute_jacobian_z_wrt_x(x)
+        # Per-example Jacobian ∂x/∂z: [B, T, F, L]
+        jac_x_z = self.compute_jacobian_x_wrt_z(z)
+
+        if nan_active:
+            check_finite(jac_z_x, "forward/jac_z_x")
+            check_finite(jac_x_z, "forward/jac_x_z")
+            check_finite(SINDy_weights, "forward/SINDy_predict.weight")
+
+        return y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
 
     def training_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
@@ -1003,8 +1144,8 @@ class SINDySz(L.LightningModule):
     def on_after_backward(self):
         """Report which model sections have non-finite gradients.
 
-        Walks parameters of each top-level section of ``self.model``
-        (encoder, decoder, SINDy_predict, plus any other direct submodules)
+        Walks parameters of each top-level section of this Lightning module
+        (encoder, decoder, sindy_model, plus any other direct submodules)
         and prints, per section:
             - which parameters have non-finite gradients (NaN / +Inf / -Inf counts)
             - which parameters have ``grad is None`` (not part of the graph)
@@ -1012,18 +1153,22 @@ class SINDySz(L.LightningModule):
         """
 
         # Build the list of (section_name, module) to inspect. Cover the named
-        # pieces of SINDyModel explicitly, plus catch anything else hanging off
-        # self.model so nothing is silently ignored.
+        # top-level components explicitly, plus catch anything else hanging off
+        # this LightningModule so nothing is silently ignored.
         sections: list[tuple[str, nn.Module]] = []
         seen_ids: set[int] = set()
-        for sect_name in ("encoder", "decoder", "SINDy_predict"):
-            sub = getattr(self.model, sect_name, None)
+        for sect_name in ("encoder", "decoder", "sindy_model"):
+            sub = getattr(self, sect_name, None)
             if isinstance(sub, nn.Module):
                 sections.append((sect_name, sub))
                 seen_ids.add(id(sub))
 
-        for child_name, child in self.model.named_children():
+        for child_name, child in self.named_children():
             if id(child) in seen_ids:
+                continue
+            # Skip the loss module; it has no parameters in this codebase but
+            # could in principle, and reporting on it is not useful here.
+            if child_name == "criterion":
                 continue
             sections.append((child_name, child))
             seen_ids.add(id(child))
@@ -1090,15 +1235,15 @@ class SINDySz(L.LightningModule):
 
         # Prune small SINDy weights after optimizer step so zeros persist into next iteration
         with torch.no_grad():
-            w = self.model.SINDy_predict.weight
+            w = self.sindy_model.SINDy_predict.weight
             w.data.masked_fill_(w.abs() < 1e-8, 0.0)
 
         # Optional: catch parameter corruption immediately after optimizer step.
         if (
-            getattr(self.model, "nan_check", False)
-            and getattr(self.model, "nan_check_level", "off") != "off"
+            getattr(self.sindy_model, "nan_check", False)
+            and getattr(self.sindy_model, "nan_check_level", "off") != "off"
         ):
-            check_module_params_finite(self.model.encoder, "post_step/encoder")
+            check_module_params_finite(self.encoder, "post_step/encoder")
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.lr)
