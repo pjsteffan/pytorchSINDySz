@@ -616,6 +616,72 @@ class SINDyModel(nn.Module):
 
 
 
+def _apply_finite_difference_batch(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    *,
+    dt: float | None = None,
+    fs: float | None = None,
+    time_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batch-aware first derivatives via finite differences.
+
+    Shared helper used by ``SINDyLoss`` and ``SINDyPathLoss``. Computes
+    derivatives along the time axis using forward/backward differences at the
+    boundaries and central differences in the interior.
+
+    Args:
+        x: Tensor [B, T, F]
+        z: Tensor [B, T, L]
+        dt: time step in seconds (preferred)
+        fs: sampling frequency in Hz (used if dt is None)
+        time_dim: time dimension (default 1)
+
+    Returns:
+        (x_dot, z_dot) with shapes [B, T, F] and [B, T, L]
+    """
+
+    if dt is None:
+        if fs is None:
+            dt = 1.0
+        else:
+            dt = 1.0 / float(fs)
+    else:
+        dt = float(dt)
+
+    if x.dim() != 3 or z.dim() != 3:
+        raise ValueError(
+            f"Expected x [B,T,F] and z [B,T,L]; got x={tuple(x.shape)} z={tuple(z.shape)}"
+        )
+    if x.shape[0] != z.shape[0] or x.shape[1] != z.shape[1]:
+        raise ValueError(
+            f"Batch/time dims must match; got x={tuple(x.shape)} z={tuple(z.shape)}"
+        )
+
+    T = int(x.shape[time_dim])
+    if T < 2:
+        raise ValueError("Need at least two time steps for finite differences")
+
+    def fd(t: torch.Tensor) -> torch.Tensor:
+        # t: [B, T, C] (with time_dim==1) -> out same shape
+        if time_dim != 1:
+            t = t.transpose(time_dim, 1)
+
+        out = torch.empty_like(t)
+        out[:, 0, :] = (t[:, 1, :] - t[:, 0, :]) / dt
+        out[:, -1, :] = (t[:, -1, :] - t[:, -2, :]) / dt
+        out[:, 1:-1, :] = (t[:, 2:, :] - t[:, :-2, :]) / (2.0 * dt)
+
+        if time_dim != 1:
+            out = out.transpose(time_dim, 1)
+        return out
+
+    return fd(x), fd(z)
+
+
+# NOTE: Used in single-optimizer mode. Computes all four loss components and
+# returns their sum. For dual-optimizer mode see ``SINDyPathLoss`` and
+# ``DecoderPathLoss`` below.
 class SINDyLoss(nn.Module):
     def __init__(self, *, nan_check: bool = False):
         super(SINDyLoss, self).__init__()
@@ -636,56 +702,12 @@ class SINDyLoss(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Batch-aware first derivatives via finite differences.
 
-        Computes derivatives along the time axis using forward/backward
-        differences at the boundaries and central differences in the interior.
-
-        Args:
-            x: Tensor [B, T, F]
-            z: Tensor [B, T, L]
-            dt: time step in seconds (preferred)
-            fs: sampling frequency in Hz (used if dt is None)
-            time_dim: time dimension (default 1)
-
-        Returns:
-            (x_dot, z_dot) with shapes [B, T, F] and [B, T, L]
+        Thin wrapper around the module-level ``_apply_finite_difference_batch``
+        helper, kept as an instance method for backward compatibility.
         """
-
-        if dt is None:
-            if fs is None:
-                dt = 1.0
-            else:
-                dt = 1.0 / float(fs)
-        else:
-            dt = float(dt)
-
-        if x.dim() != 3 or z.dim() != 3:
-            raise ValueError(
-                f"Expected x [B,T,F] and z [B,T,L]; got x={tuple(x.shape)} z={tuple(z.shape)}"
-            )
-        if x.shape[0] != z.shape[0] or x.shape[1] != z.shape[1]:
-            raise ValueError(
-                f"Batch/time dims must match; got x={tuple(x.shape)} z={tuple(z.shape)}"
-            )
-
-        T = int(x.shape[time_dim])
-        if T < 2:
-            raise ValueError("Need at least two time steps for finite differences")
-
-        def fd(t: torch.Tensor) -> torch.Tensor:
-            # t: [B, T, C] (with time_dim==1) -> out same shape
-            if time_dim != 1:
-                t = t.transpose(time_dim, 1)
-
-            out = torch.empty_like(t)
-            out[:, 0, :] = (t[:, 1, :] - t[:, 0, :]) / dt
-            out[:, -1, :] = (t[:, -1, :] - t[:, -2, :]) / dt
-            out[:, 1:-1, :] = (t[:, 2:, :] - t[:, :-2, :]) / (2.0 * dt)
-
-            if time_dim != 1:
-                out = out.transpose(time_dim, 1)
-            return out
-
-        return fd(x), fd(z)
+        return _apply_finite_difference_batch(
+            x, z, dt=dt, fs=fs, time_dim=time_dim
+        )
 
     def forward(self, x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy loss.
@@ -763,6 +785,126 @@ class SINDyLoss(nn.Module):
         )
 
 
+class SINDyPathLoss(nn.Module):
+    """Loss for the SINDy optimization path (encoder + sindy_model).
+
+    Computes the three SINDy-related loss components:
+      - ``sindy_loss_xdot`` (λ2): MSE between ``x_dot`` (finite-difference)
+        and ``x_dot_pred`` produced by mapping ``y_hat`` through the decoder
+        Jacobian.
+      - ``sindy_loss_zdot`` (λ3): MSE between ``z_dot_pred`` (encoder Jacobian
+        times ``x_dot``) and ``y_hat``.
+      - ``sindy_regularization`` (λ4): L1 penalty on the SINDy weight matrix.
+    """
+
+    def __init__(self, *, nan_check: bool = False):
+        super(SINDyPathLoss, self).__init__()
+        self.lambda2 = 1
+        self.lambda3 = 1
+        self.lambda4 = 1
+        self.nan_check = bool(nan_check)
+
+    def forward(self, x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights):
+        """Batched SINDy-path loss.
+
+        Args:
+            x: [B, T, F]
+            y_hat: [B, T, L]
+            z: [B, T, L]
+            jac_z_x: [B, T, L, F]
+            jac_x_z: [B, T, F, L]
+            SINDy_weights: [L, library_dim]
+
+        Returns:
+            (sindy_path_loss, sindy_loss_xdot, sindy_loss_zdot, sindy_regularization)
+        """
+
+        if self.nan_check:
+            check_finite(x, "sindy_path_loss/x")
+            check_finite(y_hat, "sindy_path_loss/y_hat")
+            check_finite(z, "sindy_path_loss/z")
+            check_finite(jac_z_x, "sindy_path_loss/jac_z_x")
+            check_finite(jac_x_z, "sindy_path_loss/jac_x_z")
+            check_finite(SINDy_weights, "sindy_path_loss/SINDy_weights")
+
+        x_dot, z_dot = _apply_finite_difference_batch(
+            x, z, time_dim=1, fs=100
+        )  # [B, T, F], [B, T, L]
+        y_hat_trim = y_hat
+        jac_trim = jac_z_x
+        jac_xz_trim = jac_x_z
+
+        if self.nan_check:
+            check_finite(x_dot, "sindy_path_loss/x_dot")
+            check_finite(z_dot, "sindy_path_loss/z_dot")
+
+        # Predicted x_dot from y_hat via decoder Jacobian
+        x_dot_pred = torch.einsum("btfl,btl->btf", jac_xz_trim, y_hat_trim)
+        if self.nan_check:
+            check_finite(x_dot_pred, "sindy_path_loss/x_dot_pred")
+
+        # z_dot predicted via encoder Jacobian * x_dot
+        z_dot_pred = torch.einsum("btlf,btf->btl", jac_trim, x_dot)
+        if self.nan_check:
+            check_finite(z_dot_pred, "sindy_path_loss/z_dot_pred")
+
+        sindy_loss_xdot = self.lambda2 * F.mse_loss(x_dot, x_dot_pred)
+        sindy_loss_zdot = self.lambda3 * F.mse_loss(z_dot_pred, y_hat_trim)
+        sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
+
+        if self.nan_check:
+            check_finite(sindy_loss_xdot, "sindy_path_loss/sindy_loss_xdot")
+            check_finite(sindy_loss_zdot, "sindy_path_loss/sindy_loss_zdot")
+            check_finite(sindy_regularization, "sindy_path_loss/sindy_regularization")
+
+        sindy_path_loss = sindy_loss_xdot + sindy_loss_zdot + sindy_regularization
+
+        if self.nan_check:
+            check_finite(sindy_path_loss, "sindy_path_loss/total")
+
+        return (
+            sindy_path_loss,
+            sindy_loss_xdot,
+            sindy_loss_zdot,
+            sindy_regularization,
+        )
+
+
+class DecoderPathLoss(nn.Module):
+    """Loss for the Decoder optimization path (encoder + decoder).
+
+    Computes the reconstruction loss component ``recon_loss`` (λ1) which is
+    MSE between ``x`` and ``x_hat``.
+    """
+
+    def __init__(self, *, nan_check: bool = False):
+        super(DecoderPathLoss, self).__init__()
+        self.lambda1 = 1
+        self.nan_check = bool(nan_check)
+
+    def forward(self, x, x_hat):
+        """Batched decoder-path loss.
+
+        Args:
+            x: [B, T, F]
+            x_hat: [B, T, F]
+
+        Returns:
+            (decoder_path_loss, recon_loss) -- both equal, returned for symmetry
+            with ``SINDyPathLoss``.
+        """
+        if self.nan_check:
+            check_finite(x, "decoder_path_loss/x")
+            check_finite(x_hat, "decoder_path_loss/x_hat")
+
+        recon_loss = self.lambda1 * F.mse_loss(x, x_hat)
+
+        if self.nan_check:
+            check_finite(recon_loss, "decoder_path_loss/recon_loss")
+
+        return recon_loss, recon_loss
+
+
 #
 # PyTorch Lightning Module for SINDy Training
 #
@@ -784,6 +926,9 @@ class SINDySz(L.LightningModule):
         nan_check: bool = False,
         nan_check_level: str = "basic",
         reinit: bool = True,
+        use_dual_optimizers: bool = False,
+        sindy_lr: float | None = None,
+        decoder_lr: float | None = None,
     ):
         """Lightning module that orchestrates the encode/SINDy/decode pipeline.
 
@@ -802,8 +947,22 @@ class SINDySz(L.LightningModule):
                 encoder, decoder, and sindy_model after assembly. Set to
                 False to preserve weights of caller-supplied modules (e.g.
                 a pretrained encoder/decoder).
+            use_dual_optimizers: when True, train with two separate optimizers
+                (one for the SINDy path = encoder + sindy_model, one for the
+                Decoder path = encoder + decoder). The encoder is shared and
+                receives gradients from both optimizers. Requires manual
+                optimization.
+            sindy_lr: learning rate for the SINDy-path optimizer. Defaults to
+                ``lr`` when ``None``. Only used when ``use_dual_optimizers``.
+            decoder_lr: learning rate for the Decoder-path optimizer. Defaults
+                to ``lr`` when ``None``. Only used when ``use_dual_optimizers``.
         """
         super(SINDySz, self).__init__()
+
+        # Manual optimization is required for the dual-optimizer training loop.
+        # Set this before module assembly so Lightning sees it during fit().
+        if use_dual_optimizers:
+            self.automatic_optimization = False
 
         # Resolve encoder/decoder/sindy_model from inputs. Two supported paths:
         #   1) `model` (a SINDyModel) is provided, optionally with encoder/decoder
@@ -907,8 +1066,19 @@ class SINDySz(L.LightningModule):
         self.encoder = resolved_encoder
         self.decoder = resolved_decoder
         self.sindy_model = sindy_model
-        self.criterion = SINDyLoss(nan_check=nan_check)
         self.lr = float(lr)
+
+        # Configure loss criteria and per-path learning rates based on mode.
+        self.use_dual_optimizers = bool(use_dual_optimizers)
+        if self.use_dual_optimizers:
+            self.sindy_criterion = SINDyPathLoss(nan_check=nan_check)
+            self.decoder_criterion = DecoderPathLoss(nan_check=nan_check)
+            self.sindy_lr = float(sindy_lr if sindy_lr is not None else lr)
+            self.decoder_lr = float(decoder_lr if decoder_lr is not None else lr)
+        else:
+            self.criterion = SINDyLoss(nan_check=nan_check)
+            self.sindy_lr = float(sindy_lr if sindy_lr is not None else lr)
+            self.decoder_lr = float(decoder_lr if decoder_lr is not None else lr)
 
         # Initialize each component separately. NOTE: this re-initializes
         # caller-supplied encoder/decoder modules. Pass ``reinit=False`` if
@@ -1106,38 +1276,142 @@ class SINDySz(L.LightningModule):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
+
+        if not self.use_dual_optimizers:
+            # Single-optimizer (automatic optimization) path.
+            y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+            (
+                loss,
+                recon_loss,
+                sindy_loss_xdot,
+                sindy_loss_zdot,
+                sindy_regularization,
+            ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            self.log("train_total_loss", loss)
+            self.log("train_recon_loss", recon_loss)
+            self.log("train_sindyxdot_loss", sindy_loss_xdot)
+            self.log("train_sindyzdot_loss", sindy_loss_zdot)
+            self.log("train_sindyreg_loss", sindy_regularization)
+            return loss
+
+        # Dual-optimizer (manual optimization) path.
+        opt_sindy, opt_decoder = self.optimizers()
+
+        # --- Train SINDy Path (encoder + sindy_model) ---
+        self.toggle_optimizer(opt_sindy)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss, recon_loss, sindy_loss_xdot, sindy_loss_zdot, sindy_regularization = (
-            self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
-        )
-        self.log("train_total_loss", loss)
-        self.log("train_recon_loss", recon_loss)
-        self.log("train_sindyxdot_loss", sindy_loss_xdot)
-        self.log("train_sindyzdot_loss", sindy_loss_zdot)
-        self.log("train_sindyreg_loss", sindy_regularization)
-        return loss
+        (
+            sindy_loss,
+            sindy_loss_xdot,
+            sindy_loss_zdot,
+            sindy_regularization,
+        ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        self.manual_backward(sindy_loss)
+        opt_sindy.step()
+        opt_sindy.zero_grad()
+        self.untoggle_optimizer(opt_sindy)
+
+        # --- Train Decoder Path (encoder + decoder) ---
+        # Re-run the forward pass so the decoder optimizer sees a fresh graph
+        # built from the (now-updated) encoder weights.
+        self.toggle_optimizer(opt_decoder)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+        self.manual_backward(decoder_loss)
+        opt_decoder.step()
+        opt_decoder.zero_grad()
+        self.untoggle_optimizer(opt_decoder)
+
+        # Detach for logging; both losses are scalars but we don't want to
+        # retain their computation graphs after the optimizer steps.
+        total_loss = sindy_loss.detach() + decoder_loss.detach()
+        self.log("train_total_loss", total_loss)
+        self.log("train_sindy_loss", sindy_loss.detach())
+        self.log("train_decoder_loss", decoder_loss.detach())
+        self.log("train_recon_loss", recon_loss.detach())
+        self.log("train_sindyxdot_loss", sindy_loss_xdot.detach())
+        self.log("train_sindyzdot_loss", sindy_loss_zdot.detach())
+        self.log("train_sindyreg_loss", sindy_regularization.detach())
+
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss, _, _, _, _ = self.criterion(
-            x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
-        )
-        self.log("valid_loss", loss)
-        return loss
+
+        if self.use_dual_optimizers:
+            (
+                sindy_loss,
+                sindy_loss_xdot,
+                sindy_loss_zdot,
+                sindy_regularization,
+            ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+            total_loss = sindy_loss + decoder_loss
+
+            self.log("valid_loss", total_loss)
+            self.log("valid_sindy_loss", sindy_loss)
+            self.log("valid_decoder_loss", decoder_loss)
+            self.log("valid_recon_loss", recon_loss)
+            self.log("valid_sindyxdot_loss", sindy_loss_xdot)
+            self.log("valid_sindyzdot_loss", sindy_loss_zdot)
+            self.log("valid_sindyreg_loss", sindy_regularization)
+            return total_loss
+
+        (
+            total_loss,
+            recon_loss,
+            sindy_loss_xdot,
+            sindy_loss_zdot,
+            sindy_regularization,
+        ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        self.log("valid_loss", total_loss)
+        self.log("valid_recon_loss", recon_loss)
+        self.log("valid_sindyxdot_loss", sindy_loss_xdot)
+        self.log("valid_sindyzdot_loss", sindy_loss_zdot)
+        self.log("valid_sindyreg_loss", sindy_regularization)
+        return total_loss
 
     def test_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
         y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
-        loss, _, _, _, _ = self.criterion(
-            x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
-        )
-        self.log("test_loss", loss)
-        return loss
+
+        if self.use_dual_optimizers:
+            (
+                sindy_loss,
+                sindy_loss_xdot,
+                sindy_loss_zdot,
+                sindy_regularization,
+            ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            decoder_loss, recon_loss = self.decoder_criterion(x, x_hat)
+            total_loss = sindy_loss + decoder_loss
+
+            self.log("test_loss", total_loss)
+            self.log("test_sindy_loss", sindy_loss)
+            self.log("test_decoder_loss", decoder_loss)
+            self.log("test_recon_loss", recon_loss)
+            self.log("test_sindyxdot_loss", sindy_loss_xdot)
+            self.log("test_sindyzdot_loss", sindy_loss_zdot)
+            self.log("test_sindyreg_loss", sindy_regularization)
+            return total_loss
+
+        (
+            total_loss,
+            recon_loss,
+            sindy_loss_xdot,
+            sindy_loss_zdot,
+            sindy_regularization,
+        ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        self.log("test_loss", total_loss)
+        self.log("test_recon_loss", recon_loss)
+        self.log("test_sindyxdot_loss", sindy_loss_xdot)
+        self.log("test_sindyzdot_loss", sindy_loss_zdot)
+        self.log("test_sindyreg_loss", sindy_regularization)
+        return total_loss
 
 
 
@@ -1168,7 +1442,7 @@ class SINDySz(L.LightningModule):
                 continue
             # Skip the loss module; it has no parameters in this codebase but
             # could in principle, and reporting on it is not useful here.
-            if child_name == "criterion":
+            if child_name in ("criterion", "sindy_criterion", "decoder_criterion"):
                 continue
             sections.append((child_name, child))
             seen_ids.add(id(child))
@@ -1246,8 +1520,24 @@ class SINDySz(L.LightningModule):
             check_module_params_finite(self.encoder, "post_step/encoder")
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.lr)
-        return optimizer
+        if not self.use_dual_optimizers:
+            optimizer = optim.AdamW(self.parameters(), lr=self.lr)
+            return optimizer
+
+        # Dual-optimizer setup: encoder is intentionally shared between both
+        # parameter groups so it receives gradient updates from both paths.
+        sindy_params = (
+            list(self.encoder.parameters())
+            + list(self.sindy_model.parameters())
+        )
+        decoder_params = (
+            list(self.encoder.parameters())
+            + list(self.decoder.parameters())
+        )
+
+        opt_sindy = optim.AdamW(sindy_params, lr=self.sindy_lr)
+        opt_decoder = optim.AdamW(decoder_params, lr=self.decoder_lr)
+        return [opt_sindy, opt_decoder]
 
 
 
