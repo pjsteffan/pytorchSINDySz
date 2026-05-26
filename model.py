@@ -276,62 +276,6 @@ class ShallowFANGRUDecoder(nn.Module):
         return out
 
 
-class ShallowFANGRUAutoencoder(nn.Module):
-    """shallowFAN split into encoder/decoder.
-
-    Matches the original shallowFAN_Sz architecture and enforces input_dim == output_dim
-    due to the original implicit dimension coupling.
-    """
-
-    def __init__(
-        self,
-        input_dim,
-        output_dim=None,
-        p_ratio=0.45,
-        use_p_bias=False,
-        *,
-        encoder_gru_hidden_dim: int | None = None,
-        decoder_gru_hidden_dim: int | None = None,
-        gru_layers: int = 1,
-        bidirectional: bool = False,
-    ):
-        super().__init__()
-        if output_dim is None:
-            output_dim = input_dim
-        if int(input_dim) != int(output_dim):
-            raise ValueError("ShallowFANAutoencoder requires input_dim == output_dim")
-
-        self.input_dim = int(input_dim)
-        self.output_dim = int(output_dim)
-
-        self.encoder = ShallowFANGRUEncoder(
-            self.input_dim,
-            p_ratio=p_ratio,
-            use_p_bias=use_p_bias,
-            gru_hidden_dim=encoder_gru_hidden_dim,
-            gru_layers=gru_layers,
-            bidirectional=bidirectional,
-        )
-        self.decoder = ShallowFANGRUDecoder(
-            self.output_dim,
-            p_ratio=p_ratio,
-            use_p_bias=use_p_bias,
-            gru_hidden_dim=decoder_gru_hidden_dim,
-            gru_layers=gru_layers,
-            bidirectional=bidirectional,
-        )
-
-    def forward(self, x):
-        if x.dim() == 2:
-            z = self.encoder(x)
-            return self.decoder(z)
-        if x.dim() == 3:
-            b, t, f = x.shape
-            x2 = x.reshape(b * t, f)
-            z2 = self.encoder(x2)
-            y2 = self.decoder(z2)
-            return y2.reshape(b, t, f)
-        raise ValueError(f"Expected x shape [N, F] or [B, T, F]; got {tuple(x.shape)}")
 
 
 #
