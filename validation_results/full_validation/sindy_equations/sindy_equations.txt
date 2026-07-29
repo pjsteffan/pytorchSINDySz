@@ -1,0 +1,28 @@
+SINDY EQUATIONS - DISCOVERED DYNAMICS
+======================================================================
+
+Latent dimensions: 5
+Library size: 40
+Polynomial order: 2
+Sparsity threshold: 0.001
+
+dz0/dt = -0.095657·sin_φ(z0) -0.002698·z4² +0.002083·sin_φ(z1) -0.001859·sin_φ(z4) -0.001780·sin_φ(z2) +0.001678·z1² +0.001667·cos_φ(z3) +0.001504·cos_φ(z0) +0.001106·z1·z3 -0.001016·cos_φ(z2) +0.001008·z3
+  Active terms: 11/40 (27.5%)
+  Non-zero terms: 40/40
+
+dz1/dt = -0.119082·sin_φ(z1) +0.001405·z2² +0.001357·z1 +0.001186·mag(z2)
+  Active terms: 4/40 (10.0%)
+  Non-zero terms: 40/40
+
+dz2/dt = -0.102778·sin_φ(z2) -0.001851·mag(z2) +0.001847·sin_φ(z1) -0.001633·sin_φ(z0) -0.001579·mag(z1) -0.001487·sin_φ(z4) -0.001319·mag(z0) +0.001272·z2² +0.001188·z0 -0.001085·z0²
+  Active terms: 10/40 (25.0%)
+  Non-zero terms: 40/40
+
+dz3/dt = -0.087822·sin_φ(z3)
+  Active terms: 1/40 (2.5%)
+  Non-zero terms: 40/40
+
+dz4/dt = -0.098230·sin_φ(z4) -0.002024·mag(z3) +0.001284·z1 +0.001278·z1 +0.001104·cos_φ(z1) +0.001073·sin_φ(z3) -0.001033·z0·z1
+  Active terms: 7/40 (17.5%)
+  Non-zero terms: 40/40
+

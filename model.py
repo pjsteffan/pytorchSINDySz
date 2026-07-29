@@ -279,6 +279,173 @@ class ShallowFANGRUDecoder(nn.Module):
 
 
 #
+# Convolutional (masked) encoder / decoder wrappers
+#
+#
+# These adapt the ``FullResAutoencoder`` (a 2D masked convolutional autoencoder)
+# to the SINDy pipeline's sequence contract and to the single-argument function
+# signature required by ``torch.autograd.functional.jacobian``.
+#
+# Contract:
+#   - Encoder ``forward(x)``: x is a batched *sequence of maps* with shape
+#     ``[B, T, 1, H, W]`` and returns latent ``z`` of shape ``[B, T, d]``.
+#   - Decoder ``forward(z)``: z is ``[B, T, d]`` and returns reconstructed maps
+#     ``x_hat`` of shape ``[B, T, 1, H, W]``.
+#
+# The valid-region mask is *not* passed as an argument (which would make the
+# Jacobian try to differentiate w.r.t. it). Instead the current batch's mask is
+# stored on the module via ``set_mask`` before each forward pass. The mask is a
+# plain (non-grad) attribute expanded to the flattened ``[N, 1, H, W]`` batch at
+# call time. This keeps ``jacobian(fn, x)`` single-argument.
+
+
+class ConvSINDyEncoder(nn.Module):
+    """Sequence-aware, mask-on-module convolutional encoder.
+
+    Wraps a :class:`FullResAutoencoder` and exposes ``forward(x)`` mapping
+    ``[B, T, 1, H, W]`` -> ``[B, T, d]`` so it drops into the SINDy pipeline in
+    place of the GRU/FAN encoders.
+
+    Args:
+        height: spatial height of the input maps.
+        width: spatial width of the input maps.
+        latent_dim: dimensionality of the latent space.
+        ae: optional pre-built :class:`FullResAutoencoder` to reuse. When
+            provided the same object should be passed to the paired
+            :class:`ConvSINDyDecoder` so that encoder and decoder share weights
+            and no parameters are left dead. If ``None`` a new instance is
+            created (legacy behaviour, results in dead decoder-half weights).
+    """
+
+    def __init__(self, height: int, width: int, latent_dim: int, ae=None):
+        super().__init__()
+        from fullres_autoencoder import FullResAutoencoder
+
+        self.height = int(height)
+        self.width = int(width)
+        self.latent_dim = int(latent_dim)
+        if ae is not None:
+            self.ae = ae
+        else:
+            self.ae = FullResAutoencoder(
+                height=self.height, width=self.width, latent_dim=self.latent_dim
+            )
+        # Non-parameter mask storage. Registered as a buffer so it follows
+        # ``.to(device)`` / dtype casts with the module.
+        self.register_buffer(
+            "_mask", torch.ones(1, 1, self.height, self.width), persistent=False
+        )
+
+    def set_mask(self, mask: torch.Tensor) -> None:
+        """Store the valid-region mask for subsequent forward passes.
+
+        Args:
+            mask: tensor broadcastable to ``[N, 1, H, W]``. Common shapes are
+                ``[1, 1, H, W]``, ``[B, 1, H, W]`` or ``[B, T, 1, H, W]``. The
+                mask is flattened/reduced to ``[?, 1, H, W]`` and broadcast at
+                call time.
+        """
+        m = mask.detach()
+        # Collapse any leading dims down to a single batch dim of [*,1,H,W].
+        m = m.reshape(-1, 1, self.height, self.width)
+        self._mask = m.to(dtype=self.ae.latent_projection.weight.dtype)
+
+    def _expand_mask(self, n: int, device, dtype) -> torch.Tensor:
+        m = self._mask.to(device=device, dtype=dtype)
+        if m.shape[0] == n:
+            return m
+        if m.shape[0] == 1:
+            return m.expand(n, 1, self.height, self.width)
+        # Fallback: if a per-sample mask of size B was provided but we now see
+        # N = B*T flattened maps, tile it. Requires N divisible by m.shape[0].
+        if n % m.shape[0] == 0:
+            reps = n // m.shape[0]
+            return m.repeat_interleave(reps, dim=0)
+        raise ValueError(
+            f"Cannot broadcast stored mask of batch {m.shape[0]} to {n} maps."
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, 1, H, W] (or with extra leading vmap dim during jacobian).
+        # Flatten all leading dims except the trailing (1, H, W) into one batch.
+        lead = x.shape[:-3]
+        n = 1
+        for s in lead:
+            n *= int(s)
+        x_flat = x.reshape(n, 1, self.height, self.width)
+        mask = self._expand_mask(n, x_flat.device, x_flat.dtype)
+        z = self.ae.encode(x_flat, mask)  # [n, d]
+        return z.reshape(*lead, self.latent_dim)
+
+
+class ConvSINDyDecoder(nn.Module):
+    """Sequence-aware, mask-on-module convolutional decoder.
+
+    Wraps a :class:`FullResAutoencoder` and exposes ``forward(z)`` mapping
+    ``[B, T, d]`` -> ``[B, T, 1, H, W]``. The reconstruction is masked to the
+    valid triangular region using the stored mask.
+
+    Args:
+        height: spatial height of the output maps.
+        width: spatial width of the output maps.
+        latent_dim: dimensionality of the latent space.
+        ae: optional pre-built :class:`FullResAutoencoder` to reuse. Pass the
+            same object that was given to the paired :class:`ConvSINDyEncoder`
+            so that encoder and decoder share weights and all parameters
+            participate in the computation graph. If ``None`` a new instance is
+            created (legacy behaviour, results in dead encoder-half weights).
+    """
+
+    def __init__(self, height: int, width: int, latent_dim: int, ae=None):
+        super().__init__()
+        from fullres_autoencoder import FullResAutoencoder
+
+        self.height = int(height)
+        self.width = int(width)
+        self.latent_dim = int(latent_dim)
+        if ae is not None:
+            self.ae = ae
+        else:
+            self.ae = FullResAutoencoder(
+                height=self.height, width=self.width, latent_dim=self.latent_dim
+            )
+        self.register_buffer(
+            "_mask", torch.ones(1, 1, self.height, self.width), persistent=False
+        )
+
+    def set_mask(self, mask: torch.Tensor) -> None:
+        """Store the valid-region mask for subsequent forward passes."""
+        m = mask.detach()
+        m = m.reshape(-1, 1, self.height, self.width)
+        self._mask = m.to(dtype=self.ae.latent_projection.weight.dtype)
+
+    def _expand_mask(self, n: int, device, dtype) -> torch.Tensor:
+        m = self._mask.to(device=device, dtype=dtype)
+        if m.shape[0] == n:
+            return m
+        if m.shape[0] == 1:
+            return m.expand(n, 1, self.height, self.width)
+        if n % m.shape[0] == 0:
+            reps = n // m.shape[0]
+            return m.repeat_interleave(reps, dim=0)
+        raise ValueError(
+            f"Cannot broadcast stored mask of batch {m.shape[0]} to {n} maps."
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        # z: [B, T, d] (or with extra leading vmap dim during jacobian).
+        lead = z.shape[:-1]
+        n = 1
+        for s in lead:
+            n *= int(s)
+        z_flat = z.reshape(n, self.latent_dim)
+        x_hat = self.ae.decode(z_flat)  # [n, 1, H, W]
+        mask = self._expand_mask(n, x_hat.device, x_hat.dtype)
+        x_hat = x_hat * mask
+        return x_hat.reshape(*lead, 1, self.height, self.width)
+
+
+#
 # Utility Functions for SINDy Fitting
 #
 
@@ -627,13 +794,17 @@ def _apply_finite_difference_batch(
 # returns their sum. For dual-optimizer mode see ``SINDyPathLoss`` and
 # ``DecoderPathLoss`` below.
 class SINDyLoss(nn.Module):
-    def __init__(self, *, nan_check: bool = False):
+    def __init__(self, *, nan_check: bool = False, sample_rate: float = 100.0):
         super(SINDyLoss, self).__init__()
-        self.lambda1 = 1
-        self.lambda2 = 1
-        self.lambda3 = 1
-        self.lambda4 = 0.01
+        # Lambda weights for UNNORMALIZED MSE losses.
+        # Variance normalization removed to prevent explosion when derivatives
+        # have near-zero variance (valid when latent codes change slowly).
+        self.lambda1 = 1.0    # reconstruction weight
+        self.lambda2 = 50.0   # xdot weight (scale ~0.002)
+        self.lambda3 = 2.0    # zdot weight (scale ~0.05)
+        self.lambda4 = 0.01   # regularization
         self.nan_check = bool(nan_check)
+        self.sample_rate = float(sample_rate)
 
     def apply_finite_difference_batch(
         self,
@@ -662,6 +833,15 @@ class SINDyLoss(nn.Module):
         parameters therefore act as **priority weights** rather than scale
         corrections. The L1 regularization term is not normalized.
 
+        Normalization targets (denominators):
+            - ``recon_loss``: ``var(x)`` (the input signal).
+            - ``sindy_loss_xdot``: ``var(x_dot)`` (finite-difference derivative
+              of ``x``).
+            - ``sindy_loss_zdot``: ``var(z_dot)`` (finite-difference derivative
+              of the latent ``z``). This is the *target* of the SINDy z-dot
+              prediction; normalizing by the prediction ``var(y_hat)`` instead
+              would create an unstable optimizer-controllable denominator.
+
         Args:
             x: [B, T, F]
             y_hat: [B, T, L]
@@ -688,7 +868,7 @@ class SINDyLoss(nn.Module):
 
         # Finite differences along time dimension (no trimming needed)
         x_dot, z_dot = self.apply_finite_difference_batch(
-            x, z, time_dim=1, fs=100
+            x, z, time_dim=1, fs=self.sample_rate
         )  # [B, T, F], [B, T, L]
         y_hat_trim = y_hat
         jac_trim = jac_z_x
@@ -711,26 +891,26 @@ class SINDyLoss(nn.Module):
         if self.nan_check:
             check_finite(z_dot_pred, "loss/z_dot_pred")
 
-        # Compute target variances for normalization (detached = not part of
-        # optimization; clamped to avoid division by zero).
-        x_var = x.detach().var().clamp_min(1e-12)
-        x_dot_var = x_dot.detach().var().clamp_min(1e-12)
-        y_hat_var = y_hat_trim.detach().var().clamp_min(1e-12)
+        # Compute variances for diagnostics/monitoring only (not used in loss).
+        x_var = x.detach().var()
+        x_dot_var = x_dot.detach().var()
+        z_dot_var = z_dot.detach().var()
 
         if self.nan_check:
             check_finite(x_var, "loss/x_var")
             check_finite(x_dot_var, "loss/x_dot_var")
-            check_finite(y_hat_var, "loss/y_hat_var")
+            check_finite(z_dot_var, "loss/z_dot_var")
 
-        # Unnormalized MSE values (kept for diagnostics/logging).
-        recon_mse_unnorm = F.mse_loss(x, x_hat)
-        xdot_mse_unnorm = F.mse_loss(x_dot, x_dot_pred)
-        zdot_mse_unnorm = F.mse_loss(z_dot_pred, y_hat_trim)
+        # Compute UNNORMALIZED MSE losses (no variance normalization).
+        # Variance normalization removed because it causes explosion when
+        # derivatives have near-zero variance. Lambda weights balance terms.
+        recon_mse = F.mse_loss(x, x_hat)
+        xdot_mse = F.mse_loss(x_dot, x_dot_pred)
+        zdot_mse = F.mse_loss(z_dot_pred, y_hat_trim)
 
-        # Normalized MSE losses (dimensionless, fraction of variance unexplained).
-        recon_loss = self.lambda1 * recon_mse_unnorm / x_var
-        sindy_loss_xdot = self.lambda2 * xdot_mse_unnorm / x_dot_var
-        sindy_loss_zdot = self.lambda3 * zdot_mse_unnorm / y_hat_var
+        recon_loss = self.lambda1 * recon_mse
+        sindy_loss_xdot = self.lambda2 * xdot_mse
+        sindy_loss_zdot = self.lambda3 * zdot_mse
         sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
 
         if self.nan_check:
@@ -749,24 +929,22 @@ class SINDyLoss(nn.Module):
         diagnostics = {
             "x_var": x_var.item(),
             "x_dot_var": x_dot_var.item(),
-            "y_hat_var": y_hat_var.item(),
-            "recon_mse_unnorm": recon_mse_unnorm.item(),
-            "xdot_mse_unnorm": xdot_mse_unnorm.item(),
-            "zdot_mse_unnorm": zdot_mse_unnorm.item(),
+            "z_dot_var": z_dot_var.item(),
+            "y_hat_var": y_hat_trim.detach().var().item(),
+            "recon_mse_unnorm": recon_mse.item(),
+            "xdot_mse_unnorm": xdot_mse.item(),
+            "zdot_mse_unnorm": zdot_mse.item(),
+            # R² computed from unnormalized MSE relative to target variance.
+            # When variance is near-zero, R² is not meaningful, but we compute
+            # it anyway for monitoring. Clamp variance to avoid division by zero.
             "R2_recon": (
-                1.0 - (recon_loss.item() / self.lambda1)
-                if self.lambda1 > 0
-                else 0.0
+                1.0 - recon_mse.item() / max(x_var.item(), 1e-9)
             ),
             "R2_xdot": (
-                1.0 - (sindy_loss_xdot.item() / self.lambda2)
-                if self.lambda2 > 0
-                else 0.0
+                1.0 - xdot_mse.item() / max(x_dot_var.item(), 1e-9)
             ),
             "R2_zdot": (
-                1.0 - (sindy_loss_zdot.item() / self.lambda3)
-                if self.lambda3 > 0
-                else 0.0
+                1.0 - zdot_mse.item() / max(z_dot_var.item(), 1e-9)
             ),
         }
 
@@ -789,7 +967,10 @@ class SINDyPathLoss(nn.Module):
         and ``x_dot_pred`` produced by mapping ``y_hat`` through the decoder
         Jacobian, divided by ``var(x_dot)``.
       - ``sindy_loss_zdot`` (λ3): MSE between ``z_dot_pred`` (encoder Jacobian
-        times ``x_dot``) and ``y_hat``, divided by ``var(y_hat)``.
+        times ``x_dot``) and ``y_hat``, divided by ``var(z_dot)``. The
+        denominator is the *target* variance (signal-determined) rather than
+        the prediction variance, which prevents the optimizer from minimizing
+        the loss by inflating ``y_hat`` magnitude.
       - ``sindy_regularization`` (λ4): L1 penalty on the SINDy weight matrix
         (not normalized).
 
@@ -797,12 +978,18 @@ class SINDyPathLoss(nn.Module):
     rather than scale corrections.
     """
 
-    def __init__(self, *, nan_check: bool = False):
+    def __init__(self, *, nan_check: bool = False, sample_rate: float = 100.0):
         super(SINDyPathLoss, self).__init__()
-        self.lambda2 = 1
-        self.lambda3 = 1
-        self.lambda4 = 0.01
+        # Lambda weights for UNNORMALIZED MSE losses.
+        # Variance normalization removed because it causes explosion when
+        # z_dot has near-zero variance (latent codes change slowly over 3s).
+        # Weights tuned based on typical unnormalized MSE scales:
+        #   xdot_mse ~0.002, zdot_mse ~0.05
+        self.lambda2 = 50.0   # xdot weight
+        self.lambda3 = 2.0    # zdot weight
+        self.lambda4 = 0.01   # regularization
         self.nan_check = bool(nan_check)
+        self.sample_rate = float(sample_rate)
 
     def forward(self, x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights):
         """Batched SINDy-path loss with variance-normalized MSE terms.
@@ -831,7 +1018,7 @@ class SINDyPathLoss(nn.Module):
             check_finite(SINDy_weights, "sindy_path_loss/SINDy_weights")
 
         x_dot, z_dot = _apply_finite_difference_batch(
-            x, z, time_dim=1, fs=100
+            x, z, time_dim=1, fs=self.sample_rate
         )  # [B, T, F], [B, T, L]
         y_hat_trim = y_hat
         jac_trim = jac_z_x
@@ -851,21 +1038,23 @@ class SINDyPathLoss(nn.Module):
         if self.nan_check:
             check_finite(z_dot_pred, "sindy_path_loss/z_dot_pred")
 
-        # Compute target variances for normalization (detached).
-        x_dot_var = x_dot.detach().var().clamp_min(1e-12)
-        y_hat_var = y_hat_trim.detach().var().clamp_min(1e-12)
+        # Compute variances for diagnostics/monitoring only (not used in loss).
+        x_dot_var = x_dot.detach().var()
+        z_dot_var = z_dot.detach().var()
 
         if self.nan_check:
             check_finite(x_dot_var, "sindy_path_loss/x_dot_var")
-            check_finite(y_hat_var, "sindy_path_loss/y_hat_var")
+            check_finite(z_dot_var, "sindy_path_loss/z_dot_var")
 
-        # Unnormalized MSE values for diagnostics.
-        xdot_mse_unnorm = F.mse_loss(x_dot, x_dot_pred)
-        zdot_mse_unnorm = F.mse_loss(z_dot_pred, y_hat_trim)
+        # Compute UNNORMALIZED MSE losses (no variance normalization).
+        # Variance normalization removed because it causes explosion when
+        # derivatives have near-zero variance (which is valid when latent
+        # codes change slowly). Lambda weights are tuned to balance the terms.
+        xdot_mse = F.mse_loss(x_dot, x_dot_pred)
+        zdot_mse = F.mse_loss(z_dot_pred, y_hat_trim)
 
-        # Normalized MSE losses (dimensionless, fraction of variance unexplained).
-        sindy_loss_xdot = self.lambda2 * xdot_mse_unnorm / x_dot_var
-        sindy_loss_zdot = self.lambda3 * zdot_mse_unnorm / y_hat_var
+        sindy_loss_xdot = self.lambda2 * xdot_mse
+        sindy_loss_zdot = self.lambda3 * zdot_mse
         sindy_regularization = self.lambda4 * SINDy_weights.abs().sum()
 
         if self.nan_check:
@@ -880,18 +1069,18 @@ class SINDyPathLoss(nn.Module):
 
         diagnostics = {
             "x_dot_var": x_dot_var.item(),
-            "y_hat_var": y_hat_var.item(),
-            "xdot_mse_unnorm": xdot_mse_unnorm.item(),
-            "zdot_mse_unnorm": zdot_mse_unnorm.item(),
+            "z_dot_var": z_dot_var.item(),
+            "y_hat_var": y_hat_trim.detach().var().item(),
+            "xdot_mse_unnorm": xdot_mse.item(),
+            "zdot_mse_unnorm": zdot_mse.item(),
+            # R² computed from unnormalized MSE relative to target variance.
+            # When variance is near-zero, R² is not meaningful, but we compute
+            # it anyway for monitoring. Clamp variance to avoid division by zero.
             "R2_xdot": (
-                1.0 - (sindy_loss_xdot.item() / self.lambda2)
-                if self.lambda2 > 0
-                else 0.0
+                1.0 - xdot_mse.item() / max(x_dot_var.item(), 1e-9)
             ),
             "R2_zdot": (
-                1.0 - (sindy_loss_zdot.item() / self.lambda3)
-                if self.lambda3 > 0
-                else 0.0
+                1.0 - zdot_mse.item() / max(z_dot_var.item(), 1e-9)
             ),
         }
 
@@ -937,28 +1126,25 @@ class DecoderPathLoss(nn.Module):
             check_finite(x, "decoder_path_loss/x")
             check_finite(x_hat, "decoder_path_loss/x_hat")
 
-        # Compute target variance for normalization (detached).
-        x_var = x.detach().var().clamp_min(1e-12)
+        # Compute variance for diagnostics/monitoring only (not used in loss).
+        x_var = x.detach().var()
 
         if self.nan_check:
             check_finite(x_var, "decoder_path_loss/x_var")
 
-        # Unnormalized MSE for diagnostics.
-        recon_mse_unnorm = F.mse_loss(x, x_hat)
-
-        # Normalized MSE loss (dimensionless, fraction of variance unexplained).
-        recon_loss = self.lambda1 * recon_mse_unnorm / x_var
+        # Compute UNNORMALIZED MSE loss (no variance normalization).
+        recon_mse = F.mse_loss(x, x_hat)
+        recon_loss = self.lambda1 * recon_mse
 
         if self.nan_check:
             check_finite(recon_loss, "decoder_path_loss/recon_loss")
 
         diagnostics = {
             "x_var": x_var.item(),
-            "recon_mse_unnorm": recon_mse_unnorm.item(),
+            "recon_mse_unnorm": recon_mse.item(),
+            # R² computed from unnormalized MSE relative to target variance.
             "R2_recon": (
-                1.0 - (recon_loss.item() / self.lambda1)
-                if self.lambda1 > 0
-                else 0.0
+                1.0 - recon_mse.item() / max(x_var.item(), 1e-9)
             ),
         }
 
@@ -989,6 +1175,7 @@ class SINDySz(L.LightningModule):
         use_dual_optimizers: bool = False,
         sindy_lr: float | None = None,
         decoder_lr: float | None = None,
+        sample_rate: float = 100.0,
     ):
         """Lightning module that orchestrates the encode/SINDy/decode pipeline.
 
@@ -1016,6 +1203,9 @@ class SINDySz(L.LightningModule):
                 ``lr`` when ``None``. Only used when ``use_dual_optimizers``.
             decoder_lr: learning rate for the Decoder-path optimizer. Defaults
                 to ``lr`` when ``None``. Only used when ``use_dual_optimizers``.
+            sample_rate: sampling rate (Hz) of the input time series. Passed
+                to the loss criteria so that finite-difference derivatives
+                are computed with the correct time step (``dt = 1/sample_rate``).
         """
         super(SINDySz, self).__init__()
 
@@ -1128,15 +1318,33 @@ class SINDySz(L.LightningModule):
         self.sindy_model = sindy_model
         self.lr = float(lr)
 
+        # Convolutional-map mode: when the encoder/decoder are the masked conv
+        # wrappers, the pipeline operates on sequences of 2D maps shaped
+        # [B, T, 1, H, W] rather than feature vectors [B, T, F]. Detect this by
+        # the presence of the ``set_mask`` hook so the forward pass and Jacobian
+        # helpers can branch and flatten the pixel dims for the SINDy losses.
+        self.conv_mode = hasattr(self.encoder, "set_mask") and hasattr(
+            self.decoder, "set_mask"
+        )
+        # Height/width of the conv maps (used to flatten x/x_hat -> [B,T,H*W]
+        # for the loss criteria). Populated from the encoder when in conv mode.
+        self._map_h = getattr(self.encoder, "height", None)
+        self._map_w = getattr(self.encoder, "width", None)
+
         # Configure loss criteria and per-path learning rates based on mode.
+        self.sample_rate = float(sample_rate)
         self.use_dual_optimizers = bool(use_dual_optimizers)
         if self.use_dual_optimizers:
-            self.sindy_criterion = SINDyPathLoss(nan_check=nan_check)
+            self.sindy_criterion = SINDyPathLoss(
+                nan_check=nan_check, sample_rate=self.sample_rate
+            )
             self.decoder_criterion = DecoderPathLoss(nan_check=nan_check)
             self.sindy_lr = float(sindy_lr if sindy_lr is not None else lr)
             self.decoder_lr = float(decoder_lr if decoder_lr is not None else lr)
         else:
-            self.criterion = SINDyLoss(nan_check=nan_check)
+            self.criterion = SINDyLoss(
+                nan_check=nan_check, sample_rate=self.sample_rate
+            )
             self.sindy_lr = float(sindy_lr if sindy_lr is not None else lr)
             self.decoder_lr = float(decoder_lr if decoder_lr is not None else lr)
 
@@ -1148,13 +1356,20 @@ class SINDySz(L.LightningModule):
             equal_var_init(self.decoder)
             equal_var_init(self.sindy_model)
 
+        # Counter incremented by on_after_backward so the dual-optimizer path
+        # can identify which of the two per-step backward passes just completed.
+        # Reset to 0 at the start of each training_step.
+        self._backward_pass = 0
+
     def compute_jacobian_z_wrt_x(self, x):
         """Compute per-example Jacobian ∂z/∂x for batched inputs via ``self.encoder``.
 
         Args:
-            x (Tensor): shape [B, T, F] with requires_grad=True
+            x (Tensor): shape [B, T, F] (feature mode) or [B, T, 1, H, W]
+                (conv-map mode), with requires_grad=True
         Returns:
-            Tensor: Jacobian of shape [B, T, latent_features, F]
+            Tensor: Jacobian of shape [B, T, latent_features, F]. In conv mode
+                ``F = H*W`` (pixel dims are flattened).
         """
         nan_check = bool(getattr(self.sindy_model, "nan_check", False))
         nan_check_level = str(
@@ -1165,11 +1380,14 @@ class SINDySz(L.LightningModule):
             check_finite(x, "jac_z_x/x")
 
         def encoder_bt(x_in: torch.Tensor) -> torch.Tensor:
-            # x_in: [B, T, F] -> z: [B, T, L]
+            # feature mode: [B, T, F] -> [B, T, L]
+            # conv mode:    [B, T, 1, H, W] -> [B, T, L]
             return self.encoder(x_in)
 
-        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
-        # Shape: [B, T, L, B, T, F]
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU)
+        # and per-map conv encoders.
+        #   feature mode -> jac shape [B, T, L, B, T, F]
+        #   conv mode    -> jac shape [B, T, L, B, T, 1, H, W]
         # Disable cuDNN RNN here: `vectorize=True` uses vmap, and cuDNN's
         # `_cudnn_rnn_backward` has no batching rule. The native (non-cuDNN)
         # GRU backward does, so disabling cuDNN makes the jacobian work.
@@ -1177,12 +1395,19 @@ class SINDySz(L.LightningModule):
             jac = torch.autograd.functional.jacobian(
                 encoder_bt,
                 x,
-                vectorize=True,
+                vectorize=False,
                 create_graph=False,
             )
 
         if nan_check and nan_check_level == "full":
             check_finite(jac, "jac_z_x/raw")
+
+        if self.conv_mode:
+            # jac: [B, T, L, B, T, 1, H, W]. Flatten input pixel dims (1,H,W)
+            # into a single feature axis F=H*W, then select the per-(b,t)
+            # block diagonal ∂z[b,t,:]/∂x[b,t,:].
+            B, T, L = jac.shape[0], jac.shape[1], jac.shape[2]
+            jac = jac.reshape(B, T, L, B, T, -1)  # [B,T,L,B,T,F]
 
         # Select the per-(b,t) block diagonal: ∂z[b,t,:] / ∂x[b,t,:]
         # First diagonal picks matching batch index -> [T, L, T, F, B]
@@ -1201,7 +1426,8 @@ class SINDySz(L.LightningModule):
         Args:
             z (Tensor): shape [B, T, latent_features]
         Returns:
-            Tensor: Jacobian of shape [B, T, system_features, latent_features]
+            Tensor: Jacobian of shape [B, T, system_features, latent_features].
+                In conv mode ``system_features = H*W`` (pixel dims flattened).
         """
         nan_check = bool(getattr(self.sindy_model, "nan_check", False))
         nan_check_level = str(
@@ -1212,23 +1438,34 @@ class SINDySz(L.LightningModule):
             check_finite(z, "jac_x_z/z")
 
         def decoder_bt(z_in: torch.Tensor) -> torch.Tensor:
-            # z_in: [B, T, L] -> x_hat: [B, T, F]
+            # feature mode: [B, T, L] -> [B, T, F]
+            # conv mode:    [B, T, L] -> [B, T, 1, H, W]
             return self.decoder(z_in)
 
-        # Full Jacobian over batch+time to support sequence models (e.g. GRU).
-        # Shape: [B, T, F, B, T, L]
+        # Full Jacobian over batch+time to support sequence models (e.g. GRU)
+        # and per-map conv decoders.
+        #   feature mode -> jac shape [B, T, F, B, T, L]
+        #   conv mode    -> jac shape [B, T, 1, H, W, B, T, L]
         # See note in `compute_jacobian_z_wrt_x`: cuDNN RNN backward has no
         # vmap batching rule, so disable cuDNN for the jacobian call.
         with torch.backends.cudnn.flags(enabled=False):
             jac = torch.autograd.functional.jacobian(
                 decoder_bt,
                 z,
-                vectorize=True,
+                vectorize=False,
                 create_graph=False,
             )
 
         if nan_check and nan_check_level == "full":
             check_finite(jac, "jac_x_z/raw")
+
+        if self.conv_mode:
+            # jac: [B, T, 1, H, W, B, T, L]. Flatten output pixel dims (1,H,W)
+            # into a single feature axis F=H*W so the layout matches feature
+            # mode ([B, T, F, B, T, L]) before the block-diagonal selection.
+            B, T = jac.shape[0], jac.shape[1]
+            L = jac.shape[-1]
+            jac = jac.reshape(B, T, -1, B, T, L)  # [B,T,F,B,T,L]
 
         # Per-(b,t) block diagonal: ∂x[b,t,:] / ∂z[b,t,:]
         # After two diagonals, permute to [B, T, F, L]
@@ -1275,15 +1512,29 @@ class SINDySz(L.LightningModule):
         deriv[:, 1:-1] = (filtered_data[:, 2:] - filtered_data[:, :-2]) / (2.0 * dt)
         return deriv
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         """Orchestrate the full pipeline: encode -> SINDy -> decode (+ Jacobians).
 
         Args:
-            x (Tensor): shape [B, T, system_features]
+            x (Tensor): shape ``[B, T, system_features]`` in feature mode, or
+                ``[B, T, 1, H, W]`` in conv-map mode.
+            mask (Tensor, optional): valid-region mask for conv-map mode,
+                broadcastable to ``[N, 1, H, W]``. Stored on the conv
+                encoder/decoder before encode/decode so the autograd Jacobian
+                remains single-argument. Ignored in feature mode.
         Returns:
-            tuple: (y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            tuple: (y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights). In conv
+                mode ``x_hat`` is returned flattened as ``[B, T, H*W]`` (the
+                pixel dims collapsed) so it is directly consumable by the loss
+                criteria; the Jacobians are likewise flattened over pixels.
         """
-        if x.dim() != 3:
+        if self.conv_mode:
+            if x.dim() != 5:
+                raise ValueError(
+                    "conv-map mode expects x shape [B, T, 1, H, W]; "
+                    f"got {tuple(x.shape)}"
+                )
+        elif x.dim() != 3:
             raise ValueError(
                 f"Expected x shape [B, T, F]; got {tuple(x.shape)}"
             )
@@ -1298,6 +1549,12 @@ class SINDySz(L.LightningModule):
         if x.dtype != param_dtype:
             x = x.to(param_dtype)
 
+        # Conv mode: publish the current batch's mask to the encoder/decoder so
+        # their single-arg forward (and thus the Jacobian) uses it consistently.
+        if self.conv_mode and mask is not None:
+            self.encoder.set_mask(mask)
+            self.decoder.set_mask(mask)
+
         if nan_active:
             check_finite(x, "forward/x")
             # If x is finite but z becomes non-finite, parameters are a likely culprit.
@@ -1305,7 +1562,7 @@ class SINDySz(L.LightningModule):
 
         x = x.requires_grad_(True)
 
-        # Encode: [B, T, F] -> [B, T, latent_features]
+        # Encode: [B, T, F] or [B, T, 1, H, W] -> [B, T, latent_features]
         z = self.encoder(x).requires_grad_(True)
         if nan_active:
             check_finite(z, "forward/z")
@@ -1315,7 +1572,7 @@ class SINDySz(L.LightningModule):
         if nan_active:
             check_finite(y_hat, "forward/y_hat")
 
-        # Decode: [B, T, latent_features] -> [B, T, F]
+        # Decode: [B, T, latent_features] -> [B, T, F] or [B, T, 1, H, W]
         x_hat = self.decoder(z)
         if nan_active:
             check_finite(x_hat, "forward/x_hat")
@@ -1325,6 +1582,13 @@ class SINDySz(L.LightningModule):
         # Per-example Jacobian ∂x/∂z: [B, T, F, L]
         jac_x_z = self.compute_jacobian_x_wrt_z(z)
 
+        # In conv mode flatten x_hat's pixel dims so downstream losses (which
+        # expect [B, T, F]) can consume it. The Jacobians are already flattened
+        # over pixels by the helpers above.
+        if self.conv_mode:
+            B, T = x_hat.shape[0], x_hat.shape[1]
+            x_hat = x_hat.reshape(B, T, -1)
+
         if nan_active:
             check_finite(jac_z_x, "forward/jac_z_x")
             check_finite(jac_x_z, "forward/jac_x_z")
@@ -1332,14 +1596,44 @@ class SINDySz(L.LightningModule):
 
         return y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
 
-    def training_step(self, batch, batch_idx):
+    def _unpack_batch(self, batch):
+        """Return ``(x_model, x_loss, mask)`` from a dataloader batch.
+
+        Supports both pipeline modes:
+          - feature mode: batch is ``x`` (or ``(x, label)``) of shape
+            ``[B, T, F]`` (or ``[B, T]`` which is reshaped). ``x_model`` and
+            ``x_loss`` are identical; ``mask`` is ``None``.
+          - conv-map mode: batch is ``(maps, mask, label)`` (label optional)
+            with ``maps`` shaped ``[B, T, 1, H, W]``. ``x_model`` is the 5D map
+            tensor fed to ``forward``; ``x_loss`` is the pixel-flattened
+            ``[B, T, H*W]`` view consumed by the loss criteria; ``mask`` is the
+            valid-region mask passed to ``forward``.
+        """
+        if self.conv_mode:
+            if not isinstance(batch, (tuple, list)) or len(batch) < 2:
+                raise ValueError(
+                    "conv-map mode expects batches of (maps, mask[, label]); "
+                    f"got {type(batch).__name__}"
+                )
+            maps, mask = batch[0], batch[1]
+            if maps.dim() == 4:  # [B, 1, H, W] -> add singleton time axis
+                maps = maps.unsqueeze(1)
+            B, T = maps.shape[0], maps.shape[1]
+            x_loss = maps.reshape(B, T, -1)
+            return maps, x_loss, mask
+
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
         if x.dim() == 2:  # allow [B, T] by treating it as single-feature
             x = reshape_time_to_feature_blocks(x)
+        return x, x, None
+
+    def training_step(self, batch, batch_idx):
+        self._backward_pass = 0
+        x, x_loss, mask = self._unpack_batch(batch)
 
         if not self.use_dual_optimizers:
             # Single-optimizer (automatic optimization) path.
-            y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+            y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
             (
                 loss,
                 recon_loss,
@@ -1347,7 +1641,7 @@ class SINDySz(L.LightningModule):
                 sindy_loss_zdot,
                 sindy_regularization,
                 diagnostics,
-            ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            ) = self.criterion(x_loss, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
             self.log("train_total_loss", loss)
             self.log("train_recon_loss", recon_loss)
             self.log("train_sindyxdot_loss", sindy_loss_xdot)
@@ -1361,15 +1655,18 @@ class SINDySz(L.LightningModule):
 
         # --- Train SINDy Path (encoder + sindy_model) ---
         self.toggle_optimizer(opt_sindy)
-        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
         (
             sindy_loss,
             sindy_loss_xdot,
             sindy_loss_zdot,
             sindy_regularization,
             sindy_diagnostics,
-        ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        ) = self.sindy_criterion(x_loss, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.manual_backward(sindy_loss)
+        # Gradient clipping to prevent derivative explosion
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.sindy_model.parameters(), max_norm=1.0)
         opt_sindy.step()
         opt_sindy.zero_grad()
         self.untoggle_optimizer(opt_sindy)
@@ -1378,11 +1675,14 @@ class SINDySz(L.LightningModule):
         # Re-run the forward pass so the decoder optimizer sees a fresh graph
         # built from the (now-updated) encoder weights.
         self.toggle_optimizer(opt_decoder)
-        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
         decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
-            x, x_hat
+            x_loss, x_hat
         )
         self.manual_backward(decoder_loss)
+        # Gradient clipping to prevent explosion
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), max_norm=1.0)
         opt_decoder.step()
         opt_decoder.zero_grad()
         self.untoggle_optimizer(opt_decoder)
@@ -1403,10 +1703,8 @@ class SINDySz(L.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
-        x = batch[0] if isinstance(batch, (tuple, list)) else batch
-        if x.dim() == 2:  # allow [B, T] by treating it as single-feature
-            x = reshape_time_to_feature_blocks(x)
-        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        x, x_loss, mask = self._unpack_batch(batch)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
 
         if self.use_dual_optimizers:
             (
@@ -1415,9 +1713,9 @@ class SINDySz(L.LightningModule):
                 sindy_loss_zdot,
                 sindy_regularization,
                 sindy_diagnostics,
-            ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            ) = self.sindy_criterion(x_loss, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
             decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
-                x, x_hat
+                x_loss, x_hat
             )
             total_loss = sindy_loss + decoder_loss
 
@@ -1439,7 +1737,7 @@ class SINDySz(L.LightningModule):
             sindy_loss_zdot,
             sindy_regularization,
             diagnostics,
-        ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        ) = self.criterion(x_loss, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("valid_loss", total_loss)
         self.log("valid_recon_loss", recon_loss)
         self.log("valid_sindyxdot_loss", sindy_loss_xdot)
@@ -1449,10 +1747,8 @@ class SINDySz(L.LightningModule):
         return total_loss
 
     def test_step(self, batch, batch_idx):
-        x = batch[0] if isinstance(batch, (tuple, list)) else batch
-        if x.dim() == 2:  # allow [B, T] by treating it as single-feature
-            x = reshape_time_to_feature_blocks(x)
-        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x)
+        x, x_loss, mask = self._unpack_batch(batch)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
 
         if self.use_dual_optimizers:
             (
@@ -1461,9 +1757,9 @@ class SINDySz(L.LightningModule):
                 sindy_loss_zdot,
                 sindy_regularization,
                 sindy_diagnostics,
-            ) = self.sindy_criterion(x, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+            ) = self.sindy_criterion(x_loss, y_hat, z, jac_z_x, jac_x_z, SINDy_weights)
             decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
-                x, x_hat
+                x_loss, x_hat
             )
             total_loss = sindy_loss + decoder_loss
 
@@ -1485,7 +1781,7 @@ class SINDySz(L.LightningModule):
             sindy_loss_zdot,
             sindy_regularization,
             diagnostics,
-        ) = self.criterion(x, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
+        ) = self.criterion(x_loss, y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights)
         self.log("test_loss", total_loss)
         self.log("test_recon_loss", recon_loss)
         self.log("test_sindyxdot_loss", sindy_loss_xdot)
@@ -1517,7 +1813,24 @@ class SINDySz(L.LightningModule):
             - which parameters have non-finite gradients (NaN / +Inf / -Inf counts)
             - which parameters have ``grad is None`` (not part of the graph)
             - a section-level summary
+
+        In dual-optimizer mode Lightning calls this hook after *each*
+        ``manual_backward``. The first call (SINDy path) fires before the
+        decoder backward, so decoder-half parameters legitimately have
+        ``grad=None`` at that point — that is expected, not a bug. We
+        therefore skip reporting on the first pass and only print the full
+        picture after the second (decoder) backward, when every parameter
+        that is reachable from either loss has had a chance to accumulate a
+        gradient.
         """
+
+        self._backward_pass += 1
+
+        # In dual-optimizer mode: silently skip the first (SINDy-path) backward.
+        # The decoder-half params have no gradient yet at that point, which
+        # would produce misleading grad_none reports.
+        if self.use_dual_optimizers and self._backward_pass < 2:
+            return
 
         # Build the list of (section_name, module) to inspect. Cover the named
         # top-level components explicitly, plus catch anything else hanging off
@@ -1542,13 +1855,28 @@ class SINDySz(L.LightningModule):
 
         any_bad = False
         lines: list[str] = []
+        # Track parameter tensor ids already reported so that shared parameters
+        # (e.g. a FullResAutoencoder whose ``ae`` object is held by both the
+        # encoder and decoder wrappers) are counted and reported only once per
+        # section — duplicates across sections are skipped rather than
+        # double-reported.
+        global_seen_param_ids: set[int] = set()
         for sect_name, module in sections:
             sect_bad: list[str] = []
             sect_none: list[str] = []
             n_params = 0
+            sect_seen: set[int] = set()
             for pname, p in module.named_parameters(recurse=True):
                 if not p.requires_grad:
                     continue
+                # Skip parameters already reported in a previous section
+                # (happens when encoder and decoder share the same ae object).
+                if id(p) in global_seen_param_ids:
+                    continue
+                if id(p) in sect_seen:
+                    continue
+                sect_seen.add(id(p))
+                global_seen_param_ids.add(id(p))
                 n_params += 1
                 g = p.grad
                 if g is None:

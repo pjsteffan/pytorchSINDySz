@@ -1,0 +1,24 @@
+RECONSTRUCTION VALIDATION METRICS
+==================================================
+
+Number of sequences evaluated: 5
+
+Mean Squared Error (MSE):
+  Mean:   0.031302
+  Std:    0.001680
+  Median: 0.031445
+
+R² Score:
+  Mean:   0.196068
+  Std:    0.091978
+  Median: 0.161817
+
+Per-Time-Step MSE (mean ± std):
+  t=0: 0.033591 ± 0.004635
+  t=1: 0.029564 ± 0.005299
+  t=2: 0.032034 ± 0.004305
+  t=3: 0.030988 ± 0.004984
+  t=4: 0.031553 ± 0.003995
+  t=5: 0.031917 ± 0.004567
+  t=6: 0.028378 ± 0.005911
+  t=7: 0.032389 ± 0.002089

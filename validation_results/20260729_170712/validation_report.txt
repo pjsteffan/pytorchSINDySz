@@ -1,0 +1,76 @@
+======================================================================
+SINDYSZ CONVOLUTIONAL AUTOENCODER - VALIDATION REPORT
+======================================================================
+
+Generated: 2026-07-29 17:07:56
+Output directory: validation_results/20260729_170712
+
+MODEL INFORMATION
+----------------------------------------------------------------------
+Checkpoint: lightning_logs/conv_masked_ae/lightning_logs/version_13/checkpoints/epoch=7-step=2352.ckpt
+Architecture: Convolutional SINDy Autoencoder
+  Latent features: 5
+  Time dimension: 8
+  Polynomial order: 2
+  Library size: 40
+  Grid size: 19×19
+  Dual optimizers: False
+
+DATASET INFORMATION
+----------------------------------------------------------------------
+Total sequences: 921
+Train set: 588
+Validation set: 148
+Test set: 185
+Sequence length: 8 (T=8 time steps)
+Map time step: 3.0s
+Grid size: 19×19
+
+RECONSTRUCTION VALIDATION
+----------------------------------------------------------------------
+Mean MSE: 0.030759 ± 0.001861
+Median MSE: 0.031445
+Mean R²: 0.2235 ± 0.1095
+Median R²: 0.1618
+
+SINDY EQUATION EXTRACTION
+----------------------------------------------------------------------
+Library dimension: 40
+Sparsity threshold: 0.001
+Mean sparsity: 16.5%
+Mean active terms per dimension: 6.6
+
+Sparse Equations (above threshold):
+  dz0/dt = -0.095657·sin_φ(z0) -0.002698·z4² +0.002083·sin_φ(z1) -0.001859·sin_φ(z4) -0.001780·sin_φ(z2) +0.001678·z1² +0.001667·cos_φ(z3) +0.001504·cos_φ(z0) +0.001106·z1·z3 -0.001016·cos_φ(z2) +0.001008·z3
+  dz1/dt = -0.119082·sin_φ(z1) +0.001405·z2² +0.001357·z1 +0.001186·mag(z2)
+  dz2/dt = -0.102778·sin_φ(z2) -0.001851·mag(z2) +0.001847·sin_φ(z1) -0.001633·sin_φ(z0) -0.001579·mag(z1) -0.001487·sin_φ(z4) -0.001319·mag(z0) +0.001272·z2² +0.001188·z0 -0.001085·z0²
+  dz3/dt = -0.087822·sin_φ(z3)
+  dz4/dt = -0.098230·sin_φ(z4) -0.002024·mag(z3) +0.001284·z1 +0.001278·z1 +0.001104·cos_φ(z1) +0.001073·sin_φ(z3) -0.001033·z0·z1
+
+DYNAMICS SIMULATION
+----------------------------------------------------------------------
+Stable simulations: 3/3
+Mean latent error: 0.858609 ± 0.135660
+Mean reconstruction error: 0.042838 ± 0.008610
+
+OUTPUT FILES
+----------------------------------------------------------------------
+reconstructions/
+  - sequence_*_reconstruction.png: Individual sequence comparisons
+  - reconstruction_summary.png: Aggregate metrics
+  - reconstruction_metrics.txt: Detailed metrics
+
+sindy_equations/
+  - sindy_equations.txt: Extracted equations
+  - sindy_coefficients_heatmap.png: Coefficient matrix visualization
+  - sindy_sparsity_analysis.png: Sparsity analysis
+
+dynamics_simulation/
+  - sequence_*_latent_trajectories.png: Latent space trajectories
+  - sequence_*_decoded_comparison.png: Decoded reconstructions
+  - aggregate_simulation_analysis.png: Error over time
+  - dynamics_simulation_metrics.txt: Detailed metrics
+
+======================================================================
+END OF REPORT
+======================================================================
