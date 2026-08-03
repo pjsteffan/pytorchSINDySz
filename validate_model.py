@@ -40,45 +40,162 @@ def find_latest_checkpoint(root: Path = Path("lightning_logs")) -> Path:
     return latest
 
 
+def _infer_ae_dims_from_checkpoint(checkpoint_path: Path) -> Tuple[int, int, int, int]:
+    """Read architecture dimensions directly from a checkpoint's state_dict.
+
+    Returns
+    -------
+    latent_features : int
+        Number of SINDy latent dimensions (from ``sindy_model.SINDy_predict.weight``).
+    flat_dim : int
+        Flattened spatial dimension used by the AE linear layers
+        (``128 * enc_h * enc_w``).
+    enc_h : int
+        Encoded spatial height (after 3 stride-2 blocks).
+    enc_w : int
+        Encoded spatial width (after 3 stride-2 blocks).
+    """
+    raw = torch.load(str(checkpoint_path), map_location="cpu")
+    sd = raw["state_dict"]
+
+    # latent_features from the SINDy predict layer: shape [latent_features, library_dim]
+    latent_features = sd["sindy_model.SINDy_predict.weight"].shape[0]
+
+    # flat_dim from the latent projection: shape [latent_features, flat_dim]
+    flat_dim = sd["encoder.ae.latent_projection.weight"].shape[1]
+
+    # flat_dim = 128 * enc_h * enc_w  (128 channels after 3 encoder blocks)
+    enc_spatial = flat_dim // 128
+    enc_h = int(round(enc_spatial ** 0.5))
+    # Handle non-square grids: enc_w = enc_spatial / enc_h
+    if enc_h * enc_h != enc_spatial:
+        # Try to find integer factor pair
+        for candidate_h in range(enc_h, 0, -1):
+            if enc_spatial % candidate_h == 0:
+                enc_h = candidate_h
+                break
+    enc_w = enc_spatial // enc_h
+
+    return latent_features, flat_dim, enc_h, enc_w
+
+
+def _conv_out_size(size: int, kernel_size: int = 3, stride: int = 2, padding: int = 1) -> int:
+    """Forward spatial size of one stride-2 Conv2d block (matches FullResAutoencoder)."""
+    return (size + 2 * padding - kernel_size) // stride + 1
+
+
+def _find_min_spatial_size(enc_dim: int, num_blocks: int = 3) -> int:
+    """Return the smallest input size that produces ``enc_dim`` after ``num_blocks``
+    stride-2 conv blocks.  This gives the tightest lower bound; any H in the
+    range [result, result + stride_product - 1] produces the same enc_dim.
+    """
+    stride_product = 2 ** num_blocks  # each block halves the spatial size
+    # Start from enc_dim and expand upward until we find the smallest H
+    # such that applying _conv_out_size num_blocks times gives enc_dim.
+    # Walk upward from the minimum possible input.
+    for candidate in range(enc_dim, enc_dim * stride_product + stride_product):
+        h = candidate
+        for _ in range(num_blocks):
+            h = _conv_out_size(h)
+        if h == enc_dim:
+            return candidate
+    raise ValueError(f"Could not find a spatial input size that encodes to {enc_dim}")
+
+
 def load_checkpoint_and_data(
     checkpoint_path: Path,
     data_file: str,
     annotation_file: str,
     device: str,
+    segment_seconds: float = 1.0,
+    smooth_sigma: float = 1.0,
+    epoch_size: float = 3.0,
+    f_max: float = 25.0,
+    sample_rate: int = 5000,
 ) -> Tuple[SINDySz, BicoherenceSequenceDataset, Subset, Subset, Subset]:
     """Load trained model and create dataset splits.
-    
+
+    The dataset preprocessing parameters default to those used in ``main.py``
+    so that ``dataset.get_grid_size()`` returns the same ``(H, W)`` the model
+    was trained with.  If the derived ``_flat_dim`` still does not match the
+    checkpoint, a ``RuntimeError`` is raised with a clear diagnostic before
+    PyTorch's cryptic size-mismatch error.
+
     Returns:
         model: Loaded SINDySz model in eval mode
         dataset: Full BicoherenceSequenceDataset
         train_set, valid_set, test_set: Dataset subsets
     """
     print(f"Loading checkpoint from: {checkpoint_path}")
-    
-    # First, create dataset to get grid size (needed for model reconstruction)
+
+    # ------------------------------------------------------------------
+    # Step 1: Peek inside the checkpoint to learn the architecture dims
+    # ------------------------------------------------------------------
+    ckpt_latent, ckpt_flat_dim, ckpt_enc_h, ckpt_enc_w = _infer_ae_dims_from_checkpoint(
+        checkpoint_path
+    )
+    print(
+        f"Checkpoint introspection: latent_features={ckpt_latent}, "
+        f"flat_dim={ckpt_flat_dim} (enc_h={ckpt_enc_h}, enc_w={ckpt_enc_w})"
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: Build dataset with the same preprocessing params as main.py
+    # ------------------------------------------------------------------
     time_dim = 8
-    latent_features = 5
+    latent_features = ckpt_latent
     poly_order = 2
+
     print(f"\nCreating dataset from: {data_file}")
+    print(
+        f"  Dataset params: epoch_size={epoch_size}s, segment_seconds={segment_seconds}s, "
+        f"smooth_sigma={smooth_sigma}, f_max={f_max}"
+    )
     dataset = BicoherenceSequenceDataset(
         data_file=data_file,
         annotation_file=annotation_file,
         seq_len=time_dim,
-        epoch_size=5.0,
-        f_max=25.0,
+        epoch_size=epoch_size,
+        segment_seconds=segment_seconds,
+        smooth_sigma=smooth_sigma,
+        f_max=f_max,
         epoch_id_restriction=None,
-        sample_rate=5000,
+        sample_rate=sample_rate,
     )
-    
+
     H, W = dataset.get_grid_size()
     system_features = H * W
     print(f"Dataset created: {len(dataset)} sequences, grid size: {H}×{W}")
-    
-    # Create encoder and decoder (matching main.py's build_conv_masked_ae)
+
+    # ------------------------------------------------------------------
+    # Step 3: Validate that the dataset grid matches the checkpoint dims
+    # ------------------------------------------------------------------
+    expected_flat_dim = 128 * _conv_out_size(_conv_out_size(_conv_out_size(H))) \
+                             * _conv_out_size(_conv_out_size(_conv_out_size(W)))
+    if expected_flat_dim != ckpt_flat_dim:
+        # Compute the minimum spatial sizes that would produce the checkpoint dims
+        min_h = _find_min_spatial_size(ckpt_enc_h)
+        min_w = _find_min_spatial_size(ckpt_enc_w)
+        raise RuntimeError(
+            f"Grid size mismatch: the dataset produces H={H}, W={W} "
+            f"(flat_dim={expected_flat_dim}), but the checkpoint expects "
+            f"flat_dim={ckpt_flat_dim} (enc_h={ckpt_enc_h}, enc_w={ckpt_enc_w}, "
+            f"minimum spatial input ~{min_h}×{min_w}).\n"
+            f"The dataset must be constructed with the same preprocessing "
+            f"parameters used during training (segment_seconds, smooth_sigma, "
+            f"f_max, epoch_size).  Pass them via --segment-seconds / "
+            f"--smooth-sigma / --f-max / --epoch-size."
+        )
+
+    print(f"Grid validation passed: flat_dim={ckpt_flat_dim} matches dataset H={H}, W={W}")
+
+    # ------------------------------------------------------------------
+    # Step 4: Build the model with the validated dims and load the checkpoint
+    # ------------------------------------------------------------------
     shared_ae = FullResAutoencoder(height=H, width=W, latent_dim=latent_features)
     encoder = ConvSINDyEncoder(height=H, width=W, latent_dim=latent_features, ae=shared_ae)
     decoder = ConvSINDyDecoder(height=H, width=W, latent_dim=latent_features, ae=shared_ae)
-    
+
     # Load model with explicit parameters (checkpoint doesn't save hyper_parameters)
     model = SINDySz.load_from_checkpoint(
         str(checkpoint_path),
@@ -89,7 +206,6 @@ def load_checkpoint_and_data(
         poly_order=poly_order,
         encoder=encoder,
         decoder=decoder,
-        # The state_dict will be loaded and override the weights
     )
     model.eval()
     model.to(device)
@@ -954,7 +1070,33 @@ def main():
         default=1e-3,
         help="Sparsity threshold for SINDy coefficients (default: 1e-3)"
     )
-    
+    # Dataset preprocessing parameters — must match what was used during training
+    # so that dataset.get_grid_size() returns the same (H, W) as the checkpoint.
+    parser.add_argument(
+        "--segment-seconds",
+        type=float,
+        default=1.0,
+        help="Sub-segment length (seconds) for bicoherence computation (default: 1.0, matching main.py)"
+    )
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=1.0,
+        help="Gaussian smoothing sigma for bicoherence maps (default: 1.0, matching main.py)"
+    )
+    parser.add_argument(
+        "--epoch-size",
+        type=float,
+        default=3.0,
+        help="Duration (seconds) of each annotation window (default: 3.0, matching main.py)"
+    )
+    parser.add_argument(
+        "--f-max",
+        type=float,
+        default=25.0,
+        help="Maximum bicoherence frequency in Hz (default: 25.0)"
+    )
+
     args = parser.parse_args()
     
     # Validate arguments
@@ -989,7 +1131,14 @@ def main():
         
         # Load model and data
         model, dataset, train_set, valid_set, test_set = load_checkpoint_and_data(
-            checkpoint_path, args.data_file, args.annotation_file, args.device
+            checkpoint_path,
+            args.data_file,
+            args.annotation_file,
+            args.device,
+            segment_seconds=args.segment_seconds,
+            smooth_sigma=args.smooth_sigma,
+            epoch_size=args.epoch_size,
+            f_max=args.f_max,
         )
         
         # Task 1: Reconstruction validation
