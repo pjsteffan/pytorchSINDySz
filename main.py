@@ -35,8 +35,8 @@ def main(data_file, annotation_file, sample_rate=5000):
 
     # Sequence length (SINDy time axis T): number of consecutive same-epoch
     # bicoherence maps per sample.
-    time_dim = 8 
-    latent_features = 5
+    time_dim = 16 
+    latent_features = 9
     poly_order = 2
     
     # CRITICAL: Time step between consecutive bicoherence maps in seconds.
@@ -49,7 +49,8 @@ def main(data_file, annotation_file, sample_rate=5000):
         data_file=data_file,
         annotation_file=annotation_file,
         seq_len=time_dim,
-        epoch_size=5.0,
+        epoch_size=map_time_step,
+        segment_seconds=1,
         f_max=25.0,
         epoch_id_restriction=None,
         sample_rate=sample_rate,
@@ -104,6 +105,9 @@ def main(data_file, annotation_file, sample_rate=5000):
             lr=0.001,
             nan_check=True,
             use_dual_optimizers=True,
+            # MODIFIED: Increased SINDy optimizer learning rate from 0.001 to 0.005
+            # to allow faster learning of dynamics (helps fix flat trajectory issue)
+            sindy_lr=0.005,
             # Pass the INTER-MAP time step (seconds between consecutive
             # bicoherence maps), NOT the raw EEG sample rate. The loss
             # functions convert this to dt = 1 / map_dt_hz for finite
@@ -114,7 +118,13 @@ def main(data_file, annotation_file, sample_rate=5000):
             reinit=False,
         ).to(torch.get_default_dtype())
 
-        early_stopping = EarlyStopping(monitor="valid_loss", min_delta=0.001, patience=6, check_on_train_epoch_end=False)
+        early_stopping = EarlyStopping(
+            monitor="valid_sindyzdot_loss", 
+            min_delta=0.0002,  # ~1% of typical zdot loss magnitude
+            patience=10,        # More patience for SINDy convergence
+            mode="min",         # Lower is better
+            check_on_train_epoch_end=False
+)
 
         trainer = L.Trainer(
             max_epochs=100,
