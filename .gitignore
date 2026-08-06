@@ -2,3 +2,6 @@ lightning_logs/
 results/
 optuna_sindy.db
 current_run.log
+.kilo/
+main.py.backup
+model.py.backup
