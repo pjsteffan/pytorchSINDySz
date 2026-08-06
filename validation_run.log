@@ -1,0 +1,29 @@
+Error: SINDySz requires both `encoder` and `decoder` modules; missing: encoder, decoder.
+Traceback (most recent call last):
+  File "/app/Repos/pytorchSINDySz/validate_model.py", line 983, in main
+    model, dataset, train_set, valid_set, test_set = load_checkpoint_and_data(
+                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/validate_model.py", line 77, in load_checkpoint_and_data
+    model = SINDySz.load_from_checkpoint(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/.venv/lib/python3.12/site-packages/lightning/pytorch/utilities/model_helpers.py", line 130, in wrapper
+    return self.method(cls_type, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/.venv/lib/python3.12/site-packages/lightning/pytorch/core/module.py", line 1796, in load_from_checkpoint
+    loaded = _load_from_checkpoint(
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/.venv/lib/python3.12/site-packages/lightning/pytorch/core/saving.py", line 93, in _load_from_checkpoint
+    model = _load_state(cls, checkpoint, strict=strict, **kwargs)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/.venv/lib/python3.12/site-packages/lightning/pytorch/core/saving.py", line 167, in _load_state
+    obj = instantiator(cls, _cls_kwargs) if instantiator else cls(**_cls_kwargs)
+                                                              ^^^^^^^^^^^^^^^^^^
+  File "/app/Repos/pytorchSINDySz/model.py", line 1311, in __init__
+    raise TypeError(
+TypeError: SINDySz requires both `encoder` and `decoder` modules; missing: encoder, decoder.
+Auto-discovered checkpoint: lightning_logs/conv_masked_ae/lightning_logs/version_13/checkpoints/epoch=7-step=2352.ckpt
+Output directory: validation_results/20260729_170549
+Loading checkpoint from: lightning_logs/conv_masked_ae/lightning_logs/version_13/checkpoints/epoch=7-step=2352.ckpt
+
+Creating dataset from: /app/Data/WR/WR5_Run4.hdf5
+Dataset created: 921 sequences, grid size: 19×19

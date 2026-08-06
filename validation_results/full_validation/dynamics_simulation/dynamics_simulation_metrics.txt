@@ -1,0 +1,34 @@
+DYNAMICS SIMULATION METRICS
+==================================================
+
+Number of sequences: 5/5 stable
+Time step (dt): 3.0s
+Integration method: Explicit Euler
+
+Latent Space Error (||z_sim - z_gt||):
+  Mean:   0.932208
+  Std:    0.139260
+
+Reconstruction Error (MSE):
+  Mean:   0.041878
+  Std:    0.006786
+
+Error Over Time (mean ± std):
+  Latent Error:
+    t=0: 0.000000 ± 0.000000
+    t=1: 1.140195 ± 0.391850
+    t=2: 1.103122 ± 0.243176
+    t=3: 0.973940 ± 0.284083
+    t=4: 0.993311 ± 0.426336
+    t=5: 1.014356 ± 0.369399
+    t=6: 1.332344 ± 0.750913
+    t=7: 0.900398 ± 0.394555
+  Reconstruction Error:
+    t=0: 0.033591 ± 0.004635
+    t=1: 0.039442 ± 0.008553
+    t=2: 0.039654 ± 0.003562
+    t=3: 0.037853 ± 0.005530
+    t=4: 0.038501 ± 0.007472
+    t=5: 0.041671 ± 0.011865
+    t=6: 0.066560 ± 0.051253
+    t=7: 0.037753 ± 0.006561

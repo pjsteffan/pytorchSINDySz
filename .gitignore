@@ -1,0 +1,4 @@
+lightning_logs/
+results/
+optuna_sindy.db
+current_run.log
