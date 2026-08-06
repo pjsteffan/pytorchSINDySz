@@ -1,100 +1,77 @@
-from datasets import BicoherenceSequenceDataset
-from model import (
-    SINDySz,
-    ConvSINDyEncoder,
-    ConvSINDyDecoder,
-)
-from fullres_autoencoder import FullResAutoencoder
-
-from torch.utils.data import DataLoader
-import torch.utils.data as data
+# main.py
+import optuna
+from optuna.integration import PyTorchLightningPruningCallback
 import torch
+import torch.utils.data as data
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping
+from torch.utils.data import DataLoader
+import multiprocessing as mp
+
+from datasets import BicoherenceSequenceDataset
+from model import SINDySz, ConvSINDyEncoder, ConvSINDyDecoder
+from fullres_autoencoder import FullResAutoencoder
+
+
+N_GPUS = 4
+DATA_FILE = "/app/Data/WR/WR5_Run4.hdf5"
+ANNOTATION_FILE = "/app/Data/WR/Annotations/260218_annotations_a.pkl"
+SAMPLE_RATE = 5000
+LOG_ROOT = "/app/Repos/pytorchSINDySz/lightning_logs/optuna"
+DB_PATH = "sqlite:///optuna_sindy.db"
 
 
 def build_conv_masked_ae(height: int, width: int, latent_dim: int):
-    """Construct a masked convolutional encoder/decoder pair sharing one AE.
-
-    Builds a single :class:`FullResAutoencoder` and passes it to both the
-    :class:`ConvSINDyEncoder` and :class:`ConvSINDyDecoder` wrappers.  This
-    ensures that every parameter participates in the computation graph:
-    the encoder-half weights receive gradients from the SINDy path and the
-    decoder-half weights receive gradients from the reconstruction path.
-    Previously each wrapper instantiated its own independent
-    :class:`FullResAutoencoder`, leaving the decoder-half of the encoder's AE
-    and the encoder-half of the decoder's AE permanently dead (grad=None).
-    """
     shared_ae = FullResAutoencoder(height=height, width=width, latent_dim=latent_dim)
     encoder = ConvSINDyEncoder(height=height, width=width, latent_dim=latent_dim, ae=shared_ae)
     decoder = ConvSINDyDecoder(height=height, width=width, latent_dim=latent_dim, ae=shared_ae)
     return encoder, decoder
 
 
-def main(data_file, annotation_file, sample_rate=5000):
-
-    # Sequence length (SINDy time axis T): number of consecutive same-epoch
-    # bicoherence maps per sample.
-    time_dim = 16 
-    latent_features = 9
-    poly_order = 2
-    
-    # CRITICAL: Time step between consecutive bicoherence maps in seconds.
-    # Each map is computed over a 5-second window (epoch_size), but consecutive
-    # maps in the annotation sequence are separated by this time step.
-    # This is the dt used for finite-difference derivatives in the SINDy loss.
-    map_time_step = 3.0  # seconds between consecutive bicoherence maps
-
+def make_dataloaders(time_dim, map_time_step, batch_size):
     dataset = BicoherenceSequenceDataset(
-        data_file=data_file,
-        annotation_file=annotation_file,
+        data_file=DATA_FILE,
+        annotation_file=ANNOTATION_FILE,
         seq_len=time_dim,
         epoch_size=map_time_step,
         segment_seconds=1,
         f_max=25.0,
         epoch_id_restriction=None,
-        sample_rate=sample_rate,
+        sample_rate=SAMPLE_RATE,
     )
-
-    # Grid size (H, W) is determined by the bicoherence computation; the conv
-    # autoencoder and the SINDy `system_features` (= H*W) are sized to match.
     H, W = dataset.get_grid_size()
-    system_features = H * W
 
-    trv_set_size = int(len(dataset) * 0.8)
+    trv_size = int(len(dataset) * 0.8)
+    trv_set = data.Subset(dataset, list(range(trv_size)))
+    test_set = data.Subset(dataset, list(range(trv_size, len(dataset))))
 
-    trv_indices = list(range(trv_set_size))
-    test_indices = list(range(trv_set_size, len(dataset)))
-
-    trv_set = data.Subset(dataset, trv_indices)
-    test_set = data.Subset(dataset, test_indices)
-
-    # use 20% of training data for validation
-    train_set_size = int(len(trv_set) * 0.8)
-    valid_set_size = len(trv_set) - train_set_size
-
-    # split the train set into two
+    train_size = int(len(trv_set) * 0.8)
+    valid_size = len(trv_set) - train_size
     seed = torch.Generator().manual_seed(42)
-    train_set, valid_set = data.random_split(
-        trv_set, [train_set_size, valid_set_size], generator=seed
-    )
+    train_set, valid_set = data.random_split(trv_set, [train_size, valid_size], generator=seed)
 
-    train_loader = DataLoader(train_set, batch_size=4)
-    valid_loader = DataLoader(valid_set, batch_size=4)
-    test_loader = DataLoader(test_set, batch_size=4)
+    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=2, persistent_workers=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=2, persistent_workers=True)
+    return train_loader, valid_loader, H, W, dataset
 
-    # Convolutional masked autoencoder condition.
-    #
-    # The conv encoder ingests masked H×W bicoherence maps and embeds each map
-    # as a latent vector of dimension ``latent_features``; the stack of maps in
-    # a sequence forms the SINDy time axis. The decoder reconstructs the masked
-    # map from the latent. This replaces the shallow FAN-GRU encoder/decoder.
-    conditions = [
-        ("conv_masked_ae", build_conv_masked_ae),
-    ]
 
-    for name, build_ae in conditions:
-        encoder, decoder = build_ae(H, W, latent_features)
+def objective(trial, gpu_queue):
+    gpu_id = gpu_queue.get()
+    try:
+        # ── Hyperparameters to search ─────────────────────────────────────────
+        lr            = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+        sindy_lr      = trial.suggest_float("sindy_lr", 1e-5, 1e-2, log=True)
+        decoder_lr    = trial.suggest_float("decoder_lr", 1e-5, 1e-2, log=True)
+        latent_features = trial.suggest_categorical("latent_features", [6, 9, 12, 16])
+        poly_order    = trial.suggest_int("poly_order", 1, 3)
+        time_dim      = trial.suggest_categorical("time_dim", [8, 16, 32])
+        batch_size    = trial.suggest_categorical("batch_size", [2, 4, 8])
+        map_time_step = trial.suggest_categorical("map_time_step", [1.0, 3.0, 5.0])
+
+        train_loader, valid_loader, H, W, _ = make_dataloaders(time_dim, map_time_step, batch_size)
+        system_features = H * W
+
+        encoder, decoder = build_conv_masked_ae(H, W, latent_features)
         sindy_sz = SINDySz(
             time_dim=time_dim,
             system_features=system_features,
@@ -102,45 +79,94 @@ def main(data_file, annotation_file, sample_rate=5000):
             poly_order=poly_order,
             encoder=encoder,
             decoder=decoder,
-            lr=0.0005,
-            nan_check=True,
+            lr=lr,
+            sindy_lr=sindy_lr,
+            decoder_lr=decoder_lr,
+            nan_check=False,          # keep fast during search
             use_dual_optimizers=True,
-            # MODIFIED: Increased SINDy optimizer learning rate from 0.001 to 0.005
-            # to allow faster learning of dynamics (helps fix flat trajectory issue)
-            # Pass the INTER-MAP time step (seconds between consecutive
-            # bicoherence maps), NOT the raw EEG sample rate. The loss
-            # functions convert this to dt = 1 / map_dt_hz for finite
-            # differences. With map_time_step=3.0s, map_dt_hz=1/3 Hz.
             sample_rate=(1.0 / map_time_step),
-            # Preserve the conv autoencoder's own initialization; the generic
-            # equal-variance init is designed for Linear/GRU layers, not convs.
             reinit=False,
         ).to(torch.get_default_dtype())
 
+        # ── Callbacks ─────────────────────────────────────────────────────────
+        # PyTorchLightningPruningCallback only works with automatic optimization.
+        # With use_dual_optimizers=True (manual optimization), Lightning does NOT
+        # call optimizer_step, so the standard pruning callback's check_pruned()
+        # will raise TrialPruned at the wrong time.
+        #
+        # Safe option: use EarlyStopping only. Optuna will prune based on the
+        # returned metric value between trials (MedianPruner / HyperbandPruner).
+        # If you want step-level pruning, use a custom callback (see note below).
         early_stopping = EarlyStopping(
-            monitor="valid_sindyzdot_loss", 
-            min_delta=0.0002,  # ~1% of typical zdot loss magnitude
-            patience=10,        # More patience for SINDy convergence
-            mode="min",         # Lower is better
-            check_on_train_epoch_end=False
-)
+            monitor="valid_sindyzdot_loss",
+            min_delta=0.0002,
+            patience=5,
+            mode="min",
+            check_on_train_epoch_end=False,
+        )
 
         trainer = L.Trainer(
-            max_epochs=100,
+            max_epochs=30,                  # shorter budget per trial
             log_every_n_steps=1,
             accelerator="gpu",
-            devices=1,
-            default_root_dir=f"/app/Repos/pytorchSINDySz/lightning_logs/{name}",
+            devices=[gpu_id],               # pin trial to one GPU
+            default_root_dir=f"{LOG_ROOT}/trial_{trial.number}",
             callbacks=[early_stopping],
-            fast_dev_run=False,
+            enable_progress_bar=False,      # suppress per-trial bars
             logger=True,
         )
+
         trainer.fit(sindy_sz, train_loader, valid_loader)
-    # trainer.test(sindy_sz, dataloaders=test_loader)
+
+        # Return the monitored metric; Lightning stores it in callback_metrics.
+        val_loss = trainer.callback_metrics.get("valid_sindyzdot_loss")
+        if val_loss is None:
+            # Training may have been stopped before any validation step logged
+            # this key — return a large sentinel so Optuna deprioritises the trial.
+            return float("inf")
+        return float(val_loss)
+
+    finally:
+        gpu_queue.put(gpu_id)           # always release GPU
+        del sindy_sz, trainer
+        torch.cuda.empty_cache()
+
+
+def main():
+    # Use a multiprocessing-safe queue to hand out GPU slots.
+    # Manager().Queue() is picklable and safe across forked processes.
+    manager = mp.Manager()
+    gpu_queue = manager.Queue()
+    for i in range(N_GPUS):
+        gpu_queue.put(i)
+
+    study = optuna.create_study(
+        storage=DB_PATH,
+        study_name="sindy_sz_search",
+        load_if_exists=True,
+        direction="minimize",
+        # HyperbandPruner operates at the trial level between epochs —
+        # works fine even without step-level pruning callbacks.
+        pruner=optuna.pruners.HyperbandPruner(
+            min_resource=3,
+            max_resource=30,
+            reduction_factor=3,
+        ),
+    )
+
+    # n_jobs == N_GPUS: one worker process per GPU.
+    # Each worker blocks on gpu_queue.get() until a slot is free.
+    study.optimize(
+        lambda trial: objective(trial, gpu_queue),
+        n_trials=100,
+        n_jobs=N_GPUS,
+        gc_after_trial=True,        # free memory between trials
+    )
+
+    print("Best trial:")
+    print(f"  value: {study.best_trial.value}")
+    print(f"  params: {study.best_trial.params}")
 
 
 if __name__ == "__main__":
-    main(
-        "/app/Data/WR/WR5_Run4.hdf5",
-        "/app/Data/WR/Annotations/260218_annotations_a.pkl",
-    )
+    main()
