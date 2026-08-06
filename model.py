@@ -799,10 +799,13 @@ class SINDyLoss(nn.Module):
         # Lambda weights for UNNORMALIZED MSE losses.
         # Variance normalization removed to prevent explosion when derivatives
         # have near-zero variance (valid when latent codes change slowly).
-        self.lambda1 = 1.0    # reconstruction weight
+        # MODIFIED: Increased lambda3 from 2.0 to 20.0 to give more weight to
+        # learning accurate latent dynamics (fixing flat trajectory issue).
+        # Decreased lambda4 from 0.01 to 0.001 to reduce over-regularization.
+        self.lambda1 = 0.75    # reconstruction weight
         self.lambda2 = 50.0   # xdot weight (scale ~0.002)
-        self.lambda3 = 2.0    # zdot weight (scale ~0.05)
-        self.lambda4 = 0.01   # regularization
+        self.lambda3 = 40.0   # zdot weight (increased from 2.0)
+        self.lambda4 = 0.01  # regularization (decreased from 0.01)
         self.nan_check = bool(nan_check)
         self.sample_rate = float(sample_rate)
 
@@ -985,9 +988,12 @@ class SINDyPathLoss(nn.Module):
         # z_dot has near-zero variance (latent codes change slowly over 3s).
         # Weights tuned based on typical unnormalized MSE scales:
         #   xdot_mse ~0.002, zdot_mse ~0.05
+        # MODIFIED: Increased lambda3 from 2.0 to 20.0 to give more weight to
+        # learning accurate latent dynamics (fixing flat trajectory issue).
+        # Decreased lambda4 from 0.01 to 0.001 to reduce over-regularization.
         self.lambda2 = 50.0   # xdot weight
-        self.lambda3 = 2.0    # zdot weight
-        self.lambda4 = 0.01   # regularization
+        self.lambda3 = 20.0   # zdot weight (increased from 2.0)
+        self.lambda4 = 0.001  # regularization (decreased from 0.01)
         self.nan_check = bool(nan_check)
         self.sample_rate = float(sample_rate)
 
@@ -1096,7 +1102,7 @@ class SINDyPathLoss(nn.Module):
 class DecoderPathLoss(nn.Module):
     """Loss for the Decoder optimization path (encoder + decoder).
 
-    Computes the variance-normalized reconstruction loss ``recon_loss`` (λ1):
+    Computes the variance-normalized reconstruction loss ``recon_loss`` (λ1):sindy_lr
     MSE between ``x`` and ``x_hat`` divided by ``var(x)``. The result is
     dimensionless and naturally O(1) (fraction of variance unexplained).
     With normalization ``lambda1`` acts as a priority weight rather than a
@@ -1956,9 +1962,47 @@ class SINDySz(L.LightningModule):
             + list(self.decoder.parameters())
         )
 
+        
         opt_sindy = optim.AdamW(sindy_params, lr=self.sindy_lr)
         opt_decoder = optim.AdamW(decoder_params, lr=self.decoder_lr)
-        return [opt_sindy, opt_decoder]
+
+        warmup_epochs = 5  # widen the window so the ramp is meaningful
+
+        # SINDy: ramp from 0 → full LR over warmup_epochs, then hold constant
+        sched_sindy = torch.optim.lr_scheduler.SequentialLR(
+            opt_sindy,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    opt_sindy,
+                    start_factor=0.25,   # begins at 0 * sindy_lr
+                    end_factor=1.0,     # ends at 1 * sindy_lr
+                    total_iters=warmup_epochs,
+                ),
+                torch.optim.lr_scheduler.ConstantLR(opt_sindy, factor=1.0, total_iters=1000),
+            ],
+            milestones=[warmup_epochs],
+        )
+
+        # Decoder: ramp from full LR → 0 over warmup_epochs, then hold at a low floor
+        sched_decoder = torch.optim.lr_scheduler.SequentialLR(
+            opt_decoder,
+            schedulers=[
+                torch.optim.lr_scheduler.LinearLR(
+                    opt_decoder,
+                    start_factor=1.0,   # begins at 1 * decoder_lr
+                    end_factor=0.025,     # ends at 0 * decoder_lr
+                    total_iters=warmup_epochs,
+                ),
+                torch.optim.lr_scheduler.ConstantLR(opt_decoder, factor=0.0, total_iters=1000),
+            ],
+            milestones=[warmup_epochs],
+        )
+
+        return [
+            {"optimizer": opt_sindy, "lr_scheduler": sched_sindy},
+            {"optimizer": opt_decoder, "lr_scheduler": sched_decoder},
+        ]
+
 
 
 

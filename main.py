@@ -102,12 +102,11 @@ def main(data_file, annotation_file, sample_rate=5000):
             poly_order=poly_order,
             encoder=encoder,
             decoder=decoder,
-            lr=0.001,
+            lr=0.0005,
             nan_check=True,
             use_dual_optimizers=True,
             # MODIFIED: Increased SINDy optimizer learning rate from 0.001 to 0.005
             # to allow faster learning of dynamics (helps fix flat trajectory issue)
-            sindy_lr=0.005,
             # Pass the INTER-MAP time step (seconds between consecutive
             # bicoherence maps), NOT the raw EEG sample rate. The loss
             # functions convert this to dt = 1 / map_dt_hz for finite
