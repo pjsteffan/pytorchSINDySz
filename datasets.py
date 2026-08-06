@@ -363,3 +363,227 @@ class BicoherenceSequenceDataset(Dataset):
         label = int(self._base.annotations.iloc[seg_indices[0]]["epoch_id"])
         label_t = torch.tensor(label, dtype=torch.long)
         return (maps_t, mask_t, label_t)
+
+
+class RawBicoherenceSequenceDataset(Dataset):
+    """Annotation-agnostic variant of :class:`BicoherenceSequenceDataset`.
+
+    Produces the exact same per-window bicoherence-map sequences, but tiles
+    windows **contiguously across the entire raw recording** instead of using an
+    annotation table to place windows or to group them into sequences. The
+    bicoherence windowing/math is identical to
+    :class:`BicoherenceSequenceDataset`.
+
+    Window ``k`` starts at ``k * epoch_size`` seconds and is
+    ``epoch_size`` seconds long. The whole recording is treated as one
+    contiguous run of ``num_windows = floor(total_samples / epoch_num_samples)``
+    windows, sliced into fixed-length ``seq_len`` sequences with ``stride``
+    (default ``seq_len``, i.e. non-overlapping sequences). The trailing partial
+    window (if any) is dropped so every window is full length.
+
+    ``__getitem__`` returns ``(maps, mask, label)`` matching the annotated class:
+
+    - ``maps``: float tensor ``[T, 1, H, W]`` (NaNs replaced with 0).
+    - ``mask``: float tensor ``[1, H, W]`` marking the valid lower-triangular
+      region.
+    - ``label``: constant ``-1`` placeholder (kept only for API parity; there is
+      no annotation to derive a real label from).
+
+    Preprocessing per window mirrors :class:`WRsmallepoch` exactly:
+    ``downsample`` -> band-pass ``filter_data`` (5-30 Hz) -> z-score using the
+    recording-wide ``mean``/``std`` HDF5 attributes.
+
+    Parameters
+    ----------
+    data_file : str
+        HDF5 signal file (same format used by :class:`WRsmallepoch`).
+    seq_len : int
+        Number of consecutive windows per sample (the SINDy T).
+    epoch_size : float
+        Duration (seconds) of each window.
+    f_max, segment_seconds, segment_overlap, smooth_sigma :
+        Bicoherence parameters, forwarded to :func:`compute_bicoherence`.
+    sample_rate : int
+        Native sampling rate of the HDF5 signal (downsampled to 100 Hz).
+    stride : int, optional
+        Step (in windows) between consecutive sequence samples. Defaults to
+        ``seq_len`` (non-overlapping sequences).
+    channel : str
+        HDF5 dataset key to read (default ``"Ch.1"``).
+    """
+
+    # Bicoherence is computed on the 100 Hz preprocessed signal.
+    _TARGET_FS = 100.0
+
+    def __init__(
+        self,
+        data_file: str,
+        seq_len: int = 8,
+        epoch_size: float = 5.0,
+        f_max: float = 25.0,
+        segment_seconds: float = 0.75,
+        segment_overlap: float = 0.5,
+        smooth_sigma: float = 0.0,
+        sample_rate: int = 5000,
+        stride: int | None = None,
+        channel: str = "Ch.1",
+    ):
+        super().__init__()
+        if seq_len < 2:
+            raise ValueError("seq_len must be >= 2 (SINDy needs a time axis)")
+
+        self.data_file = data_file
+        self.seq_len = int(seq_len)
+        self.epoch_size = float(epoch_size)
+        self.f_max = float(f_max)
+        self.segment_seconds = float(segment_seconds)
+        self.segment_overlap = float(segment_overlap)
+        self.smooth_sigma = float(smooth_sigma)
+        self.sample_rate = int(sample_rate)
+        self.stride = int(stride) if stride is not None else int(seq_len)
+        self.channel = str(channel)
+
+        self.epoch_num_samples = int(self.epoch_size * self.sample_rate)
+
+        # Total window count comes from the raw recording length (HDF5 shape).
+        with h5py.File(self.data_file, "r") as f:
+            n_samples = f[self.channel].shape[0]
+        self.num_windows = int(n_samples // self.epoch_num_samples)
+        if self.num_windows < self.seq_len:
+            raise ValueError(
+                f"Recording has only {self.num_windows} full windows of "
+                f"{self.epoch_size}s, but seq_len={self.seq_len}. Reduce "
+                "seq_len or epoch_size."
+            )
+
+        # Contiguous tiling: one run over all windows, sliced into sequences.
+        self._sequences = self._build_sequences()
+
+        # Grid size + mask are discovered lazily on first access and cached.
+        self._grid: tuple[int, int] | None = None
+        self._mask: torch.Tensor | None = None
+
+    # -- sequence index construction ---------------------------------------
+
+    def _build_sequences(self) -> list[list[int]]:
+        run = list(range(self.num_windows))
+        sequences: list[list[int]] = [
+            run[start : start + self.seq_len]
+            for start in range(0, self.num_windows - self.seq_len + 1, self.stride)
+        ]
+        if not sequences:
+            raise ValueError(
+                f"No sequences of length {self.seq_len} could be formed from "
+                f"{self.num_windows} windows with stride {self.stride}."
+            )
+        return sequences
+
+    # -- preprocessing / bicoherence for one window ------------------------
+
+    def _segment_signal(self, window_idx: int) -> np.ndarray:
+        """Return the preprocessed 100 Hz time-domain signal for one window."""
+        start_index = window_idx * self.epoch_num_samples
+        with h5py.File(self.data_file, "r") as f:
+            ch = f[self.channel][start_index : start_index + self.epoch_num_samples]
+            ch_mean = f[self.channel].attrs["mean"]
+            ch_std = f[self.channel].attrs["std"]
+        # Stateless helpers reused from WRsmallepoch (no instance needed).
+        ch = WRsmallepoch.downsample(
+            self, ch, original_fs=self.sample_rate, target_fs=self._TARGET_FS
+        )
+        ch = WRsmallepoch.filter_data(
+            self, ch, lowcut=5, highcut=30, fs=self._TARGET_FS, order=5
+        )
+        ch = (ch - ch_mean) / (ch_std + 1e-6)
+        return np.ascontiguousarray(ch, dtype=np.float64)
+
+    def _bicoherence_map(self, window_idx: int) -> np.ndarray:
+        """Compute the bicoherence map for one window (NaNs preserved)."""
+        from REFERENCE.bispectral.analysis import compute_bicoherence
+
+        signal = self._segment_signal(window_idx)
+        bres = compute_bicoherence(
+            signal=signal,
+            fs=self._TARGET_FS,
+            f_max=self.f_max,
+            seg_seconds=self.segment_seconds,
+            overlap=self.segment_overlap,
+            smooth_sigma=self.smooth_sigma,
+        )
+        return np.asarray(bres.bicoherence, dtype=np.float64)
+
+    # -- grid / mask helpers -----------------------------------------------
+
+    def _ensure_grid_and_mask(self) -> None:
+        if self._grid is not None:
+            return
+        from REFERENCE.bispectral.analysis import compute_bicoherence
+
+        probe_idx = self._sequences[0][0]
+        signal = self._segment_signal(probe_idx)
+        bres = compute_bicoherence(
+            signal=signal,
+            fs=self._TARGET_FS,
+            f_max=self.f_max,
+            seg_seconds=self.segment_seconds,
+            overlap=self.segment_overlap,
+            smooth_sigma=self.smooth_sigma,
+        )
+        bmap = np.asarray(bres.bicoherence, dtype=np.float64)
+        H, W = bmap.shape
+        self._grid = (int(H), int(W))
+        mask = np.isfinite(bmap).astype(np.float32)
+        self._mask = torch.from_numpy(mask).reshape(1, H, W)
+        # Cache frequency axes (Hz) for plotting/labelling; same grid for all
+        # windows since it depends only on fs/seg_seconds/f_max.
+        self._f1s = np.asarray(bres.f1s, dtype=np.float64)
+        self._f2s = np.asarray(bres.f2s, dtype=np.float64)
+
+    @property
+    def height(self) -> int:
+        self._ensure_grid_and_mask()
+        return self._grid[0]
+
+    @property
+    def width(self) -> int:
+        self._ensure_grid_and_mask()
+        return self._grid[1]
+
+    def get_grid_size(self) -> tuple[int, int]:
+        self._ensure_grid_and_mask()
+        return self._grid
+
+    def get_mask(self) -> torch.Tensor:
+        """Return the shared valid-region mask, shape ``[1, H, W]``."""
+        self._ensure_grid_and_mask()
+        return self._mask.clone()
+
+    def get_freq_axes(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(f1s, f2s)`` frequency axes (Hz) of the bicoherence grid."""
+        self._ensure_grid_and_mask()
+        return self._f1s.copy(), self._f2s.copy()
+
+    def window_start_seconds(self, seq_idx: int) -> list[float]:
+        """Start time (s) of each window in sequence ``seq_idx`` (for labels)."""
+        return [w * self.epoch_size for w in self._sequences[seq_idx]]
+
+    # -- Dataset protocol ---------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._sequences)
+
+    def __getitem__(self, idx: int):
+        self._ensure_grid_and_mask()
+        H, W = self._grid
+        win_indices = self._sequences[idx]
+
+        maps = np.empty((self.seq_len, 1, H, W), dtype=np.float32)
+        for t, win_idx in enumerate(win_indices):
+            bmap = self._bicoherence_map(win_idx)
+            maps[t, 0] = np.nan_to_num(bmap, nan=0.0).astype(np.float32)
+
+        maps_t = torch.from_numpy(maps).to(torch.get_default_dtype())
+        mask_t = self._mask.to(torch.get_default_dtype())
+        # Annotation-agnostic: constant placeholder label for API parity.
+        label_t = torch.tensor(-1, dtype=torch.long)
+        return (maps_t, mask_t, label_t)
