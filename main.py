@@ -4,18 +4,118 @@ from optuna.integration import PyTorchLightningPruningCallback
 import torch
 import torch.utils.data as data
 import lightning as L
-from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import Callback, EarlyStopping
 from torch.utils.data import DataLoader
 import multiprocessing as mp
 
-from datasets import BicoherenceSequenceDataset
+from datasets import RawBicoherenceSequenceDataset
 from model import SINDySz, ConvSINDyEncoder, ConvSINDyDecoder
 from fullres_autoencoder import FullResAutoencoder
 
 
-N_GPUS = 4
+class OptunaProgressCallback(Callback):
+    """Update Optuna trial user attributes with live epoch and batch progress.
+
+    Writes two attributes after every training batch so the Optuna dashboard
+    can show where a running trial is within its training budget:
+      - ``current_epoch``:    integer epoch index (0-based, matching Lightning).
+      - ``epoch_pct``:        float in [0, 100] — percentage of the current
+                              epoch's batches that have been processed.
+
+    Attributes are also written at epoch start (``epoch_pct = 0.0``) so the
+    dashboard shows an update immediately when a new epoch begins, even if
+    batches are slow.
+    """
+
+    def __init__(self, trial: optuna.Trial, max_epochs: int):
+        super().__init__()
+        self.trial = trial
+        self.max_epochs = int(max_epochs)
+        # Cached total number of training batches per epoch; resolved once from
+        # the first on_train_epoch_start call so we don't rely on the dataloader
+        # being finite-length at construction time.
+        self._batches_per_epoch: int | None = None
+
+    def _resolve_batches_per_epoch(self, trainer: L.Trainer) -> int:
+        """Return total training batches per epoch, or a fallback of 1."""
+        try:
+            n = trainer.num_training_batches
+            if n is not None and n > 0:
+                return int(n)
+        except Exception:
+            pass
+        return 1
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        self._batches_per_epoch = self._resolve_batches_per_epoch(trainer)
+        epoch = int(trainer.current_epoch)
+        self.trial.set_user_attr("current_epoch", epoch)
+        self.trial.set_user_attr("max_epochs", self.max_epochs)
+        self.trial.set_user_attr("epoch_pct", 0.0)
+
+    def on_train_batch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        total = self._batches_per_epoch or self._resolve_batches_per_epoch(trainer)
+        if total and total > 0:
+            pct = round(100.0 * (batch_idx + 1) / total, 1)
+        else:
+            pct = 0.0
+        epoch = int(trainer.current_epoch)
+        self.trial.set_user_attr("current_epoch", epoch)
+        self.trial.set_user_attr("epoch_pct", pct)
+
+
+class OptunaPruningCallback(Callback):
+    """Report validation loss to Optuna after each epoch and prune if needed.
+
+    Calls ``trial.report(value, step)`` so that the HyperbandPruner can act
+    on per-epoch intermediate results rather than only between completed trials.
+    Also records secondary metrics as trial user attributes for dashboard
+    visibility (they do not affect the pruning objective).
+    """
+
+    def __init__(self, trial: optuna.Trial, monitor: str = "valid_sindyzdot_loss"):
+        super().__init__()
+        self.trial = trial
+        self.monitor = monitor
+
+    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        metrics = trainer.callback_metrics
+
+        # Primary metric: drives pruning decision.
+        val = metrics.get(self.monitor)
+        if val is None:
+            return
+        self.trial.report(float(val), step=trainer.current_epoch)
+
+        # Secondary metrics: stored as user attrs for richer dashboard display.
+        for attr_key, metric_key in (
+            ("valid_R2_recon_last",    "valid_R2_recon"),
+            ("valid_R2_xdot_last",     "valid_R2_xdot"),
+            ("valid_R2_zdot_last",     "valid_R2_zdot"),
+            ("valid_recon_loss_last",  "valid_recon_loss"),
+            ("valid_sindy_loss_last",  "valid_sindy_loss"),
+            ("valid_decoder_loss_last","valid_decoder_loss"),
+        ):
+            v = metrics.get(metric_key)
+            if v is not None:
+                self.trial.set_user_attr(attr_key, float(v))
+
+        if self.trial.should_prune():
+            raise optuna.TrialPruned(
+                f"Trial {self.trial.number} pruned at epoch {trainer.current_epoch} "
+                f"({self.monitor}={float(val):.6g})"
+            )
+
+
+N_GPUS = 1
 DATA_FILE = "/app/Data/WR/WR5_Run4.hdf5"
-ANNOTATION_FILE = "/app/Data/WR/Annotations/260218_annotations_a.pkl"
 SAMPLE_RATE = 5000
 LOG_ROOT = "/app/Repos/pytorchSINDySz/lightning_logs/optuna"
 DB_PATH = "sqlite:///optuna_sindy.db"
@@ -29,14 +129,13 @@ def build_conv_masked_ae(height: int, width: int, latent_dim: int):
 
 
 def make_dataloaders(time_dim, map_time_step, batch_size):
-    dataset = BicoherenceSequenceDataset(
+    dataset = RawBicoherenceSequenceDataset(
         data_file=DATA_FILE,
-        annotation_file=ANNOTATION_FILE,
         seq_len=time_dim,
         epoch_size=map_time_step,
-        segment_seconds=1,
+        segment_seconds=0.75,
+        segment_overlap=0.5,
         f_max=25.0,
-        epoch_id_restriction=None,
         sample_rate=SAMPLE_RATE,
     )
     H, W = dataset.get_grid_size()
@@ -63,7 +162,7 @@ def objective(trial, gpu_queue):
         sindy_lr      = trial.suggest_float("sindy_lr", 1e-5, 1e-2, log=True)
         decoder_lr    = trial.suggest_float("decoder_lr", 1e-5, 1e-2, log=True)
         latent_features = trial.suggest_categorical("latent_features", [6, 9, 12, 16])
-        poly_order    = trial.suggest_int("poly_order", 1, 3)
+        poly_order    = trial.suggest_categorical("poly_order", [1, 2, 3])
         time_dim      = trial.suggest_categorical("time_dim", [8, 16, 32])
         batch_size    = trial.suggest_categorical("batch_size", [2, 4, 8])
         map_time_step = trial.suggest_categorical("map_time_step", [1.0, 3.0, 5.0])
@@ -89,14 +188,12 @@ def objective(trial, gpu_queue):
         ).to(torch.get_default_dtype())
 
         # ── Callbacks ─────────────────────────────────────────────────────────
-        # PyTorchLightningPruningCallback only works with automatic optimization.
-        # With use_dual_optimizers=True (manual optimization), Lightning does NOT
-        # call optimizer_step, so the standard pruning callback's check_pruned()
-        # will raise TrialPruned at the wrong time.
-        #
-        # Safe option: use EarlyStopping only. Optuna will prune based on the
-        # returned metric value between trials (MedianPruner / HyperbandPruner).
-        # If you want step-level pruning, use a custom callback (see note below).
+        # OptunaPruningCallback calls trial.report() after every validation epoch
+        # so the HyperbandPruner can act on per-epoch intermediate results.
+        # (The standard PyTorchLightningPruningCallback only works with automatic
+        # optimization; our manual dual-optimizer loop requires this custom one.)
+        pruning_cb = OptunaPruningCallback(trial, monitor="valid_sindyzdot_loss")
+        progress_cb = OptunaProgressCallback(trial, max_epochs=30)
         early_stopping = EarlyStopping(
             monitor="valid_sindyzdot_loss",
             min_delta=0.0002,
@@ -111,7 +208,7 @@ def objective(trial, gpu_queue):
             accelerator="gpu",
             devices=[gpu_id],               # pin trial to one GPU
             default_root_dir=f"{LOG_ROOT}/trial_{trial.number}",
-            callbacks=[early_stopping],
+            callbacks=[early_stopping, pruning_cb, progress_cb],
             enable_progress_bar=False,      # suppress per-trial bars
             logger=True,
         )
@@ -124,6 +221,38 @@ def objective(trial, gpu_queue):
             # Training may have been stopped before any validation step logged
             # this key — return a large sentinel so Optuna deprioritises the trial.
             return float("inf")
+
+        # ── Post-fit user attributes ───────────────────────────────────────────
+        # Store interpretable attributes that survive in the Optuna DB and are
+        # visible in the dashboard, without affecting the pruning objective.
+        metrics = trainer.callback_metrics
+
+        # Decomposed final validation losses.
+        for attr_key, metric_key in (
+            ("final_valid_recon_loss",   "valid_recon_loss"),
+            ("final_valid_sindy_loss",   "valid_sindy_loss"),
+            ("final_valid_decoder_loss", "valid_decoder_loss"),
+            ("final_valid_R2_recon",     "valid_R2_recon"),
+            ("final_valid_R2_xdot",      "valid_R2_xdot"),
+            ("final_valid_R2_zdot",      "valid_R2_zdot"),
+        ):
+            v = metrics.get(metric_key)
+            if v is not None:
+                trial.set_user_attr(attr_key, float(v))
+
+        # SINDy weight sparsity: fraction of coefficients thresholded to zero.
+        with torch.no_grad():
+            w = sindy_sz.sindy_model.SINDy_predict.weight
+            sparsity = float((w.abs() < 1e-8).float().mean().item())
+        trial.set_user_attr("sindy_sparsity_final", sparsity)
+
+        # Convenience copies of key hyperparams as user attrs so they appear
+        # alongside the metrics in the dashboard without needing to cross-reference
+        # the params table.
+        trial.set_user_attr("latent_features", latent_features)
+        trial.set_user_attr("poly_order", poly_order)
+        trial.set_user_attr("time_dim", time_dim)
+
         return float(val_loss)
 
     finally:
