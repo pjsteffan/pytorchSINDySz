@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import lightning as L
+import logging
 
 # Avoid shadowing torch.nn.functional imported as F.
 import torch.nn.functional as F
@@ -9,6 +10,8 @@ import torch.nn.functional as F
 from itertools import combinations_with_replacement
 import numpy as np
 from typing import Any
+
+_log = logging.getLogger(__name__)
 
 
 def _finite_summary(
@@ -1928,8 +1931,10 @@ class SINDySz(L.LightningModule):
         else:
             lines.insert(0, "[on_after_backward] all gradients finite")
 
-        # Single print to keep output coherent across distributed/async logs.
-        print("\n".join(lines))
+        # Single log call to keep output coherent across distributed/async logs.
+        # Use logging instead of print so this is safe in multiprocessing worker
+        # subprocesses where stdout may already be closed during trial teardown.
+        _log.debug("\n".join(lines))
     
 
     def on_train_batch_end(self, outputs, batch, batch_idx):

@@ -7,7 +7,7 @@ import lightning as L
 from lightning.pytorch.callbacks import Callback, EarlyStopping
 from torch.utils.data import DataLoader
 import multiprocessing as mp
-
+import logging
 import os
 
 from datasets import RawBicoherenceSequenceDataset
@@ -158,6 +158,21 @@ def make_dataloaders(time_dim, map_time_step, batch_size):
 
 def objective(trial, gpu_queue):
     gpu_id = gpu_queue.get()
+
+    # Per-trial file handler for gradient debug output from model.py.
+    # Writing to a file (rather than stdout) is safe in multiprocessing worker
+    # subprocesses where stdout can be closed during trial teardown.
+    trial_log_dir = f"{LOG_ROOT}/trial_{trial.number}"
+    os.makedirs(trial_log_dir, exist_ok=True)
+    _trial_fh = logging.FileHandler(
+        f"{trial_log_dir}/grad_debug.log", mode="a", delay=False
+    )
+    _trial_fh.setLevel(logging.DEBUG)
+    _trial_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _model_logger = logging.getLogger("model")
+    _model_logger.setLevel(logging.DEBUG)
+    _model_logger.addHandler(_trial_fh)
+
     try:
         # ── Hyperparameters to search ─────────────────────────────────────────
         lr            = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
@@ -261,6 +276,10 @@ def objective(trial, gpu_queue):
         gpu_queue.put(gpu_id)           # always release GPU
         del sindy_sz, trainer
         torch.cuda.empty_cache()
+        # Remove and close the per-trial file handler so it doesn't accumulate
+        # across repeated calls in the same worker process.
+        _model_logger.removeHandler(_trial_fh)
+        _trial_fh.close()
 
 
 def main():
