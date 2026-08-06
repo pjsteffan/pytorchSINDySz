@@ -8,6 +8,8 @@ from lightning.pytorch.callbacks import Callback, EarlyStopping
 from torch.utils.data import DataLoader
 import multiprocessing as mp
 
+import os
+
 from datasets import RawBicoherenceSequenceDataset
 from model import SINDySz, ConvSINDyEncoder, ConvSINDyDecoder
 from fullres_autoencoder import FullResAutoencoder
@@ -114,7 +116,7 @@ class OptunaPruningCallback(Callback):
             )
 
 
-N_GPUS = 1
+N_GPUS = int(os.getenv("N_GPUS", "1"))
 DATA_FILE = "/app/Data/WR/WR5_Run4.hdf5"
 SAMPLE_RATE = 5000
 LOG_ROOT = "/app/Repos/pytorchSINDySz/lightning_logs/optuna"
