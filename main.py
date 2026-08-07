@@ -120,7 +120,7 @@ N_GPUS = int(os.getenv("N_GPUS", "1"))
 DATA_FILE = "/app/Data/WR/WR5_Run4.hdf5"
 SAMPLE_RATE = 5000
 LOG_ROOT = "/app/Repos/pytorchSINDySz/lightning_logs/optuna"
-DB_PATH = "sqlite:////app/Data/WR/optuna_sindy.db"
+DB_PATH = os.getenv("OPTUNA_DB_PATH", "sqlite:////app/Data/WR/optuna_sindy.db")
 
 
 def build_conv_masked_ae(height: int, width: int, latent_dim: int):
