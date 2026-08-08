@@ -1,3 +1,4 @@
+import os
 import torch
 import numpy as np
 import h5py
@@ -585,5 +586,273 @@ class RawBicoherenceSequenceDataset(Dataset):
         maps_t = torch.from_numpy(maps).to(torch.get_default_dtype())
         mask_t = self._mask.to(torch.get_default_dtype())
         # Annotation-agnostic: constant placeholder label for API parity.
+        label_t = torch.tensor(-1, dtype=torch.long)
+        return (maps_t, mask_t, label_t)
+
+
+def group_name_for_epoch_size(epoch_size: float) -> str:
+    """Return the HDF5 group name used to store maps for ``epoch_size``.
+
+    Kept as a module-level helper so the precompute script and the dataset
+    agree on the naming convention (``f"es_{epoch_size:g}"``).
+    """
+    return f"es_{float(epoch_size):g}"
+
+
+class PrecomputedBicoherenceSequenceDataset(Dataset):
+    """Drop-in replacement for :class:`RawBicoherenceSequenceDataset` that reads
+    per-window bicoherence maps from a precomputed HDF5 cache instead of
+    computing them on the fly.
+
+    The expensive :func:`compute_bicoherence` call is run **once** by
+    ``precompute_bicoherence.py`` and every trial/worker simply reads the
+    resulting maps from disk. Because the per-window map depends only on the
+    signal slice and the bicoherence parameters (not on ``seq_len``/``stride``/
+    ``batch_size``), a single cached map set per ``epoch_size`` serves every
+    trial regardless of those hyperparameters.
+
+    ``__getitem__`` returns ``(maps, mask, label)`` identical in shape/dtype to
+    :class:`RawBicoherenceSequenceDataset`:
+
+    - ``maps``: float tensor ``[T, 1, H, W]`` (NaNs already replaced with 0 in
+      the cache).
+    - ``mask``: float tensor ``[1, H, W]`` marking the valid lower-triangular
+      region.
+    - ``label``: constant ``-1`` placeholder for API parity.
+
+    Concurrency
+    -----------
+    The cache is opened **read-only** with ``swmr=True``. Each process (each
+    Optuna trial) and each DataLoader worker opens its **own** handle lazily on
+    first access; the handle is never shared across processes and is dropped from
+    the pickled state (see :meth:`__getstate__`) so forked/spawned workers
+    re-open it themselves. This is the standard safe pattern for many concurrent
+    readers of a static HDF5 file, so multiple trials can read simultaneously
+    without conflict (the writer, ``precompute_bicoherence.py``, runs once and
+    finishes before any trial starts).
+
+    Parameters
+    ----------
+    cache_file : str
+        Path to the precomputed HDF5 cache (produced by
+        ``precompute_bicoherence.py``).
+    epoch_size : float
+        Window duration (seconds); selects the ``es_{epoch_size:g}`` group.
+    seq_len : int
+        Number of consecutive windows per sample (the SINDy T).
+    stride : int, optional
+        Step (in windows) between consecutive sequences. Defaults to ``seq_len``
+        (non-overlapping sequences).
+    segment_seconds, segment_overlap, f_max, smooth_sigma, sample_rate, channel :
+        Bicoherence parameters. These are **validated** against the cache group's
+        stored attributes; a mismatch raises with instructions to re-run the
+        precompute script. They do not trigger any computation here.
+    """
+
+    # Bicoherence is computed on the 100 Hz preprocessed signal.
+    _TARGET_FS = 100.0
+
+    def __init__(
+        self,
+        cache_file: str,
+        epoch_size: float,
+        seq_len: int = 8,
+        stride: int | None = None,
+        segment_seconds: float = 0.75,
+        segment_overlap: float = 0.5,
+        f_max: float = 25.0,
+        smooth_sigma: float = 0.0,
+        sample_rate: int = 5000,
+        channel: str = "Ch.1",
+    ):
+        super().__init__()
+        if seq_len < 2:
+            raise ValueError("seq_len must be >= 2 (SINDy needs a time axis)")
+
+        self.cache_file = str(cache_file)
+        self.epoch_size = float(epoch_size)
+        self.seq_len = int(seq_len)
+        self.stride = int(stride) if stride is not None else int(seq_len)
+        self.segment_seconds = float(segment_seconds)
+        self.segment_overlap = float(segment_overlap)
+        self.f_max = float(f_max)
+        self.smooth_sigma = float(smooth_sigma)
+        self.sample_rate = int(sample_rate)
+        self.channel = str(channel)
+
+        self._group_name = group_name_for_epoch_size(self.epoch_size)
+
+        # Read metadata (tiny) once in the constructing process, validating the
+        # cache against the requested parameters. The read handle used here is
+        # closed immediately; per-worker handles are opened lazily in __getitem__.
+        self._read_metadata_and_validate()
+
+        # Build the sequence index using the same windowing logic as
+        # RawBicoherenceSequenceDataset._build_sequences.
+        if self.num_windows < self.seq_len:
+            raise ValueError(
+                f"Cached group '{self._group_name}' has only {self.num_windows} "
+                f"windows, but seq_len={self.seq_len}. Reduce seq_len or "
+                "epoch_size."
+            )
+        self._sequences = self._build_sequences()
+
+        # Per-worker HDF5 handle, opened lazily; never pickled (see __getstate__).
+        self._h5 = None
+        self._maps_ds = None
+
+    # -- metadata / validation ---------------------------------------------
+
+    def _read_metadata_and_validate(self) -> None:
+        if not os.path.exists(self.cache_file):
+            raise FileNotFoundError(
+                f"Bicoherence cache not found: {self.cache_file}. Run "
+                "precompute_bicoherence.py to generate it."
+            )
+        # Use a plain "r" open for the metadata check: the file is a completed
+        # (non-SWMR) HDF5 written by precompute_bicoherence.py. Per-worker
+        # reads in __getitem__ use swmr=True + libver="latest" which is
+        # compatible with a non-SWMR file for concurrent read-only access.
+        with h5py.File(self.cache_file, "r") as f:
+            if self._group_name not in f:
+                raise KeyError(
+                    f"Cache '{self.cache_file}' has no group "
+                    f"'{self._group_name}' for epoch_size={self.epoch_size}. "
+                    "Re-run precompute_bicoherence.py with this epoch_size."
+                )
+            g = f[self._group_name]
+            if not bool(g.attrs.get("complete", False)):
+                raise RuntimeError(
+                    f"Cache group '{self._group_name}' is incomplete (a previous "
+                    "precompute run may have been interrupted). Re-run "
+                    "precompute_bicoherence.py (optionally with --force)."
+                )
+
+            # Validate the bicoherence parameters stored on the group against
+            # what this dataset was constructed with. A mismatch means the cache
+            # was built for different settings and must not be used silently.
+            expected = {
+                "epoch_size": self.epoch_size,
+                "segment_seconds": self.segment_seconds,
+                "segment_overlap": self.segment_overlap,
+                "f_max": self.f_max,
+                "smooth_sigma": self.smooth_sigma,
+                "sample_rate": self.sample_rate,
+                "channel": self.channel,
+            }
+            mismatches = []
+            for k, want in expected.items():
+                got = g.attrs.get(k, None)
+                if isinstance(want, str):
+                    got_s = got.decode() if isinstance(got, bytes) else got
+                    if got_s != want:
+                        mismatches.append(f"{k}: cache={got_s!r} requested={want!r}")
+                else:
+                    if got is None or not np.isclose(float(got), float(want)):
+                        mismatches.append(f"{k}: cache={got} requested={want}")
+            if mismatches:
+                raise ValueError(
+                    "Bicoherence cache parameter mismatch for group "
+                    f"'{self._group_name}':\n  " + "\n  ".join(mismatches) + "\n"
+                    "Re-run precompute_bicoherence.py with matching parameters."
+                )
+
+            self.num_windows = int(g.attrs["num_windows"])
+            H = int(g.attrs["height"])
+            W = int(g.attrs["width"])
+            self._grid = (H, W)
+            mask = np.asarray(g["mask"][()], dtype=np.float32)
+            self._mask = torch.from_numpy(mask).reshape(1, H, W)
+            self._f1s = np.asarray(g["f1s"][()], dtype=np.float64)
+            self._f2s = np.asarray(g["f2s"][()], dtype=np.float64)
+
+    # -- sequence index construction ---------------------------------------
+
+    def _build_sequences(self) -> list[list[int]]:
+        run = list(range(self.num_windows))
+        sequences: list[list[int]] = [
+            run[start : start + self.seq_len]
+            for start in range(0, self.num_windows - self.seq_len + 1, self.stride)
+        ]
+        if not sequences:
+            raise ValueError(
+                f"No sequences of length {self.seq_len} could be formed from "
+                f"{self.num_windows} windows with stride {self.stride}."
+            )
+        return sequences
+
+    # -- lazy per-worker handle --------------------------------------------
+
+    def _ensure_open(self) -> None:
+        """Open this process's own read-only handle on first access."""
+        if self._h5 is None:
+            self._h5 = h5py.File(
+                self.cache_file, "r", swmr=True, libver="latest"
+            )
+            self._maps_ds = self._h5[self._group_name]["maps"]
+
+    def __getstate__(self):
+        # Do not pickle the open HDF5 handle: each worker must open its own.
+        state = self.__dict__.copy()
+        state["_h5"] = None
+        state["_maps_ds"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._h5 = None
+        self._maps_ds = None
+
+    # -- grid / mask helpers -----------------------------------------------
+
+    @property
+    def height(self) -> int:
+        return self._grid[0]
+
+    @property
+    def width(self) -> int:
+        return self._grid[1]
+
+    def get_grid_size(self) -> tuple[int, int]:
+        return self._grid
+
+    def get_mask(self) -> torch.Tensor:
+        """Return the shared valid-region mask, shape ``[1, H, W]``."""
+        return self._mask.clone()
+
+    def get_freq_axes(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(f1s, f2s)`` frequency axes (Hz) of the bicoherence grid."""
+        return self._f1s.copy(), self._f2s.copy()
+
+    def window_start_seconds(self, seq_idx: int) -> list[float]:
+        """Start time (s) of each window in sequence ``seq_idx`` (for labels)."""
+        return [w * self.epoch_size for w in self._sequences[seq_idx]]
+
+    # -- Dataset protocol ---------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._sequences)
+
+    def __getitem__(self, idx: int):
+        self._ensure_open()
+        H, W = self._grid
+        win_indices = self._sequences[idx]
+
+        # h5py fancy indexing requires a sorted, unique index list. With the
+        # default stride == seq_len windows are disjoint and already sorted, but
+        # sort defensively and restore the requested order afterwards.
+        order = np.argsort(win_indices)
+        sorted_idx = list(np.asarray(win_indices)[order])
+        sorted_maps = np.asarray(self._maps_ds[sorted_idx], dtype=np.float32)
+        # Undo the sort to match the sequence's temporal order.
+        inv = np.empty_like(order)
+        inv[order] = np.arange(len(order))
+        raw = sorted_maps[inv]  # [T, H, W]
+
+        maps = raw.reshape(self.seq_len, 1, H, W)
+        maps_t = torch.from_numpy(np.ascontiguousarray(maps)).to(
+            torch.get_default_dtype()
+        )
+        mask_t = self._mask.to(torch.get_default_dtype())
         label_t = torch.tensor(-1, dtype=torch.long)
         return (maps_t, mask_t, label_t)
