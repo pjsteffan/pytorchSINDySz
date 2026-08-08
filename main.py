@@ -179,6 +179,7 @@ def make_dataloaders(time_dim, map_time_step, batch_size):
         cache_file=BICOH_CACHE_FILE,
         epoch_size=map_time_step,
         seq_len=time_dim,
+        smooth_sigma=2,
         segment_seconds=SEGMENT_SECONDS,
         segment_overlap=SEGMENT_OVERLAP,
         f_max=F_MAX,
