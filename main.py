@@ -10,7 +10,10 @@ import multiprocessing as mp
 import logging
 import os
 
-from datasets import RawBicoherenceSequenceDataset
+from datasets import (
+    PrecomputedBicoherenceSequenceDataset,
+    group_name_for_epoch_size,
+)
 from model import SINDySz, ConvSINDyEncoder, ConvSINDyDecoder
 from fullres_autoencoder import FullResAutoencoder
 
@@ -118,9 +121,47 @@ class OptunaPruningCallback(Callback):
 
 N_GPUS = int(os.getenv("N_GPUS", "1"))
 DATA_FILE = "/app/Data/WR/WR5_Run4.hdf5"
+# Precomputed per-window bicoherence cache (see precompute_bicoherence.py).
+# All trials read maps from here instead of recomputing them on the fly.
+BICOH_CACHE_FILE = os.getenv(
+    "BICOH_CACHE_FILE", "/app/Data/WR/WR5_Run4_bicoh.hdf5"
+)
 SAMPLE_RATE = 5000
 LOG_ROOT = "/app/Repos/pytorchSINDySz/lightning_logs/optuna"
 DB_PATH = os.getenv("OPTUNA_DB_PATH", "sqlite:////app/Data/WR/optuna_sindy.db")
+
+# Bicoherence parameters. Must match precompute_bicoherence.py exactly so the
+# cache groups validate against the datasets constructed below.
+SEGMENT_SECONDS = 0.75
+SEGMENT_OVERLAP = 0.5
+F_MAX = 25.0
+# epoch_size (map_time_step) values searched by Optuna; every one must have a
+# precomputed group in BICOH_CACHE_FILE before training starts.
+EPOCH_SIZES = (1.0, 3.0, 5.0)
+
+
+def _verify_bicoh_cache() -> None:
+    """Fail fast (before spawning trials) if the cache is missing/incomplete."""
+    import h5py
+
+    if not os.path.exists(BICOH_CACHE_FILE):
+        raise FileNotFoundError(
+            f"Bicoherence cache not found: {BICOH_CACHE_FILE}\n"
+            "Run: .venv/bin/python precompute_bicoherence.py"
+        )
+    missing = []
+    with h5py.File(BICOH_CACHE_FILE, "r") as f:
+        for es in EPOCH_SIZES:
+            name = group_name_for_epoch_size(es)
+            if name not in f or not bool(f[name].attrs.get("complete", False)):
+                missing.append(es)
+    if missing:
+        raise RuntimeError(
+            f"Bicoherence cache {BICOH_CACHE_FILE} is missing/incomplete for "
+            f"epoch_sizes {missing}. Run:\n"
+            f"  .venv/bin/python precompute_bicoherence.py "
+            f"--epoch-sizes {' '.join(str(e) for e in EPOCH_SIZES)}"
+        )
 
 
 def build_conv_masked_ae(height: int, width: int, latent_dim: int):
@@ -131,13 +172,16 @@ def build_conv_masked_ae(height: int, width: int, latent_dim: int):
 
 
 def make_dataloaders(time_dim, map_time_step, batch_size):
-    dataset = RawBicoherenceSequenceDataset(
-        data_file=DATA_FILE,
-        seq_len=time_dim,
+    # Reads precomputed maps from BICOH_CACHE_FILE (cheap disk lookups) instead
+    # of computing bicoherence on the fly. Multiple trials read concurrently and
+    # safely (read-only, swmr, per-worker handles).
+    dataset = PrecomputedBicoherenceSequenceDataset(
+        cache_file=BICOH_CACHE_FILE,
         epoch_size=map_time_step,
-        segment_seconds=0.75,
-        segment_overlap=0.5,
-        f_max=25.0,
+        seq_len=time_dim,
+        segment_seconds=SEGMENT_SECONDS,
+        segment_overlap=SEGMENT_OVERLAP,
+        f_max=F_MAX,
         sample_rate=SAMPLE_RATE,
     )
     H, W = dataset.get_grid_size()
@@ -151,8 +195,10 @@ def make_dataloaders(time_dim, map_time_step, batch_size):
     seed = torch.Generator().manual_seed(42)
     train_set, valid_set = data.random_split(trv_set, [train_size, valid_size], generator=seed)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=2, persistent_workers=True)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=2, persistent_workers=True)
+    # Reads are now cheap cached lookups, so more workers help keep GPUs fed.
+    # Each worker opens its own read-only HDF5 handle (safe concurrent reads).
+    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=4, persistent_workers=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=4, persistent_workers=True)
     return train_loader, valid_loader, H, W, dataset
 
 
@@ -180,7 +226,7 @@ def objective(trial, gpu_queue):
         decoder_lr    = trial.suggest_float("decoder_lr", 1e-5, 1e-2, log=True)
         latent_features = trial.suggest_categorical("latent_features", [6, 9, 12, 16])
         poly_order    = trial.suggest_categorical("poly_order", [1, 2, 3])
-        time_dim      = trial.suggest_categorical("time_dim", [8, 16, 32])
+        time_dim      = trial.suggest_categorical("time_dim", [4, 8, 12])
         batch_size    = trial.suggest_categorical("batch_size", [2, 4, 8])
         map_time_step = trial.suggest_categorical("map_time_step", [1.0, 3.0, 5.0])
 
@@ -283,6 +329,10 @@ def objective(trial, gpu_queue):
 
 
 def main():
+    # Fail fast if the bicoherence cache is missing/incomplete, before spawning
+    # any trials or GPU workers.
+    _verify_bicoh_cache()
+
     # Use a multiprocessing-safe queue to hand out GPU slots.
     # Manager().Queue() is picklable and safe across forked processes.
     manager = mp.Manager()
