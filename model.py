@@ -1521,7 +1521,7 @@ class SINDySz(L.LightningModule):
         deriv[:, 1:-1] = (filtered_data[:, 2:] - filtered_data[:, :-2]) / (2.0 * dt)
         return deriv
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, *, compute_jacobians: bool = True):
         """Orchestrate the full pipeline: encode -> SINDy -> decode (+ Jacobians).
 
         Args:
@@ -1531,11 +1531,18 @@ class SINDySz(L.LightningModule):
                 broadcastable to ``[N, 1, H, W]``. Stored on the conv
                 encoder/decoder before encode/decode so the autograd Jacobian
                 remains single-argument. Ignored in feature mode.
+            compute_jacobians (bool): when ``False``, skip both
+                ``compute_jacobian_z_wrt_x`` and ``compute_jacobian_x_wrt_z``
+                and return ``None`` in their tuple slots. The return tuple
+                always has the same 6-element structure so no call site needs
+                to change its unpacking. Defaults to ``True``.
         Returns:
             tuple: (y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights). In conv
                 mode ``x_hat`` is returned flattened as ``[B, T, H*W]`` (the
                 pixel dims collapsed) so it is directly consumable by the loss
-                criteria; the Jacobians are likewise flattened over pixels.
+                criteria; the Jacobians are likewise flattened over pixels. When
+                ``compute_jacobians=False``, ``jac_z_x`` and ``jac_x_z`` are
+                ``None``.
         """
         if self.conv_mode:
             if x.dim() != 5:
@@ -1586,10 +1593,14 @@ class SINDySz(L.LightningModule):
         if nan_active:
             check_finite(x_hat, "forward/x_hat")
 
-        # Per-example Jacobian ∂z/∂x: [B, T, L, F]
-        jac_z_x = self.compute_jacobian_z_wrt_x(x)
-        # Per-example Jacobian ∂x/∂z: [B, T, F, L]
-        jac_x_z = self.compute_jacobian_x_wrt_z(z)
+        if compute_jacobians:
+            # Per-example Jacobian ∂z/∂x: [B, T, L, F]
+            jac_z_x = self.compute_jacobian_z_wrt_x(x)
+            # Per-example Jacobian ∂x/∂z: [B, T, F, L]
+            jac_x_z = self.compute_jacobian_x_wrt_z(z)
+        else:
+            jac_z_x = None
+            jac_x_z = None
 
         # In conv mode flatten x_hat's pixel dims so downstream losses (which
         # expect [B, T, F]) can consume it. The Jacobians are already flattened
@@ -1599,8 +1610,10 @@ class SINDySz(L.LightningModule):
             x_hat = x_hat.reshape(B, T, -1)
 
         if nan_active:
-            check_finite(jac_z_x, "forward/jac_z_x")
-            check_finite(jac_x_z, "forward/jac_x_z")
+            if jac_z_x is not None:
+                check_finite(jac_z_x, "forward/jac_z_x")
+            if jac_x_z is not None:
+                check_finite(jac_x_z, "forward/jac_x_z")
             check_finite(SINDy_weights, "forward/SINDy_predict.weight")
 
         return y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights
@@ -1683,8 +1696,12 @@ class SINDySz(L.LightningModule):
         # --- Train Decoder Path (encoder + decoder) ---
         # Re-run the forward pass so the decoder optimizer sees a fresh graph
         # built from the (now-updated) encoder weights.
+        # Jacobians are not used by decoder_criterion; skip them to avoid
+        # B×T×(H×W + L) redundant backward passes (the dominant per-step cost).
         self.toggle_optimizer(opt_decoder)
-        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(x, mask)
+        y_hat, x_hat, z, jac_z_x, jac_x_z, SINDy_weights = self.forward(
+            x, mask, compute_jacobians=False
+        )
         decoder_loss, recon_loss, decoder_diagnostics = self.decoder_criterion(
             x_loss, x_hat
         )
