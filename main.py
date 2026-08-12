@@ -227,9 +227,23 @@ def objective(trial, gpu_queue):
         decoder_lr    = trial.suggest_float("decoder_lr", 1e-5, 1e-2, log=True)
         latent_features = trial.suggest_categorical("latent_features", [6, 9, 12, 16])
         poly_order    = trial.suggest_categorical("poly_order", [1, 2, 3])
-        time_dim      = trial.suggest_categorical("time_dim", [4, 8, 12])
-        batch_size    = trial.suggest_categorical("batch_size", [2, 4, 8])
-        map_time_step = trial.suggest_categorical("map_time_step", [1.0, 3.0, 5.0])
+        time_dim      = trial.suggest_categorical("time_dim", [4, 6,  8])
+        # Constrain the per-step compute budget: the vectorize=False Jacobian in
+        # SINDySz cost scales ~ B*T*(F+L), so we only explore trials with
+        # batch_size * time_dim <= 16 to keep per-epoch wall-clock tractable
+        # (see profile_dataset_size.py). batch_size is suggested conditionally on
+        # the sampled time_dim so only feasible sizes are offered, avoiding
+        # wasted pruned trials.
+        MAX_BT = 16
+        feasible_batch_sizes = [bs for bs in (2, 4, 8) if bs * time_dim <= MAX_BT]
+        if not feasible_batch_sizes:
+            # No batch size satisfies the constraint for this time_dim; skip.
+            raise optuna.TrialPruned(
+                f"No batch_size with batch_size*time_dim<={MAX_BT} for "
+                f"time_dim={time_dim}"
+            )
+        batch_size    = trial.suggest_categorical("batch_size", feasible_batch_sizes)
+        map_time_step = trial.suggest_categorical("map_time_step", [3.0, 5.0])
 
         train_loader, valid_loader, H, W, _ = make_dataloaders(time_dim, map_time_step, batch_size)
         system_features = H * W
