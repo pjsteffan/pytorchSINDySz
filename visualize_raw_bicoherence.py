@@ -29,12 +29,21 @@ matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 import numpy as np
 
-from datasets import RawBicoherenceSequenceDataset
+from datasets import (
+    PrecomputedBicoherenceSequenceDataset,
+    RawBicoherenceSequenceDataset,
+)
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-file", default="/app/Data/WR/WR5_Run4.hdf5")
+    p.add_argument(
+        "--cache-file",
+        default=None,
+        help="If given, read precomputed maps from this HDF5 cache "
+        "(PrecomputedBicoherenceSequenceDataset) instead of computing on the fly.",
+    )
     p.add_argument("--out-dir", default="bicoherence_previews")
     p.add_argument("--num-sequences", type=int, default=3,
                    help="How many sequences to render.")
@@ -107,17 +116,30 @@ def main() -> None:
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    dataset = RawBicoherenceSequenceDataset(
-        data_file=args.data_file,
-        seq_len=args.seq_len,
-        epoch_size=args.epoch_size,
-        f_max=args.f_max,
-        segment_seconds=args.segment_seconds,
-        segment_overlap=args.segment_overlap,
-        smooth_sigma=args.smooth_sigma,
-        sample_rate=args.sample_rate,
-        channel=args.channel,
-    )
+    if args.cache_file:
+        dataset = PrecomputedBicoherenceSequenceDataset(
+            cache_file=args.cache_file,
+            epoch_size=args.epoch_size,
+            seq_len=args.seq_len,
+            f_max=args.f_max,
+            segment_seconds=args.segment_seconds,
+            segment_overlap=args.segment_overlap,
+            smooth_sigma=args.smooth_sigma,
+            sample_rate=args.sample_rate,
+            channel=args.channel,
+        )
+    else:
+        dataset = RawBicoherenceSequenceDataset(
+            data_file=args.data_file,
+            seq_len=args.seq_len,
+            epoch_size=args.epoch_size,
+            f_max=args.f_max,
+            segment_seconds=args.segment_seconds,
+            segment_overlap=args.segment_overlap,
+            smooth_sigma=args.smooth_sigma,
+            sample_rate=args.sample_rate,
+            channel=args.channel,
+        )
 
     n_total = len(dataset)
     H, W = dataset.get_grid_size()
