@@ -221,6 +221,9 @@ def objective(trial, gpu_queue):
     _model_logger.addHandler(_trial_fh)
 
     try:
+        sindy_sz = None  # guard against NameError in finally if exception is raised early
+        trainer = None   # (e.g. TrialPruned before model construction)
+
         # ── Hyperparameters to search ─────────────────────────────────────────
         lr            = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
         sindy_lr      = trial.suggest_float("sindy_lr", 1e-5, 1e-2, log=True)
@@ -376,6 +379,7 @@ def main():
         n_trials=100,
         n_jobs=N_GPUS,
         gc_after_trial=True,        # free memory between trials
+        catch=(Exception,),         # mark unexpected errors as FAIL and continue
     )
 
     print("Best trial:")
