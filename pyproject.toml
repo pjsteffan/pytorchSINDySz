@@ -29,6 +29,12 @@ dev = [
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu124"
 
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu124"
